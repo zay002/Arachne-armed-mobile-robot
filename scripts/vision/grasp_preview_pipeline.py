@@ -5,9 +5,12 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
@@ -118,6 +121,99 @@ PREVIEW_MAX_JOINT_ACCEL_RAD_SEC2 = 4.50
 PREVIEW_MAX_JOINT_JERK_RAD_SEC3 = 100.0
 PREVIEW_SMOOTHING_TAU_SEC = 0.04
 COLLISION_PENALTY = 1_000_000.0
+DEFAULT_AUBO_TEACH_FLAG_PATH = "/tmp/arachne_aubo_teach_mode"
+DEFAULT_AUBO_CONTROL_OWNER_PATH = "/tmp/arachne_aubo_control_owner"
+
+
+def _control_owner_payload(owner: str) -> str:
+    return json.dumps(
+        {"owner": owner, "pid": os.getpid(), "created_at": time.time()},
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def _parse_control_owner(text: str) -> tuple[str, int | None]:
+    text = text.strip()
+    if not text:
+        return "", None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text.splitlines()[0].strip(), None
+    owner = str(data.get("owner", "")).strip()
+    pid_value = data.get("pid")
+    try:
+        pid = int(pid_value) if pid_value is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    return owner, pid
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _claim_control_owner(path: Path, owner: str) -> tuple[bool, str]:
+    owner = owner.strip() or "grasp_task_server"
+    for _attempt in range(2):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return False, f"unreadable owner file {path}: {exc}"
+            active_owner, pid = _parse_control_owner(text)
+            if active_owner == owner and pid == os.getpid():
+                return True, f"already owned by {owner}"
+            if pid is not None and not _pid_alive(pid):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    return False, f"stale owner {active_owner or text!r} could not be cleared: {exc}"
+                continue
+            pid_text = str(pid) if pid is not None else "unknown"
+            return False, f"owned by {active_owner or text.strip() or 'unknown'} pid={pid_text}"
+        except OSError as exc:
+            return False, f"could not create owner file {path}: {exc}"
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(_control_owner_payload(owner))
+        except OSError as exc:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False, f"could not write owner file {path}: {exc}"
+        return True, f"owned by {owner}"
+    return False, f"could not claim owner file {path}"
+
+
+def _release_control_owner(path: Path, owner: str) -> None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    active_owner, pid = _parse_control_owner(text)
+    if active_owner != (owner.strip() or "grasp_task_server"):
+        return
+    if pid is not None and pid != os.getpid():
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
 
 
 @dataclass
@@ -126,6 +222,8 @@ class Detection:
     class_id: int
     confidence: float
     xyxy: tuple[float, float, float, float]
+    mask_xy: tuple[tuple[float, float], ...] | None = None
+    mask_area_px: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -158,6 +256,21 @@ class CollisionBox:
     size: tuple[float, float, float]
 
 
+@dataclass(frozen=True)
+class PointCloudGraspShape:
+    center_base: tuple[float, float, float]
+    major_axis_base: tuple[float, float, float]
+    minor_axis_base: tuple[float, float, float]
+    visual_axis_base: tuple[float, float, float] | None
+    extent_major_m: float
+    extent_minor_m: float
+    extent_z_m: float
+    axis_confidence: float
+    visual_axis_confidence: float
+    point_count: int
+    z_bias_m: float
+
+
 @dataclass
 class GraspPreview:
     detection: Detection
@@ -167,6 +280,7 @@ class GraspPreview:
     lift_xyz: tuple[float, float, float]
     retreat_xyz: tuple[float, float, float]
     roi_points: list[tuple[float, float, float]]
+    roi_source: str
     bbox_points: list[tuple[float, float, float]]
     base_path_xyz: list[tuple[float, float, float]]
     base_trajectory_segments: list[CartesianSegment]
@@ -174,6 +288,7 @@ class GraspPreview:
     arm_trajectory_frames: list[JointTrajectoryFrame]
     basket_safe: bool
     base_grasp_xyz: tuple[float, float, float] | None
+    pointcloud_shape: PointCloudGraspShape | None
     snapshot_reason: str
     ik_message: str
 
@@ -189,11 +304,16 @@ def _add_venv_site_packages(venv: Path) -> None:
             sys.path.insert(0, str(candidate))
 
 
-def _load_yolo(venv: Path, model_path: Path):
+def _load_yolo(venv: Path, model_path: Path, task: str, initial_device: str = ""):
+    os.environ.setdefault("YOLO_AUTOINSTALL", "false")
     _add_venv_site_packages(venv)
     from ultralytics import YOLO
 
-    return YOLO(str(model_path))
+    kwargs = {"task": task} if task else {}
+    model = YOLO(str(model_path), **kwargs)
+    if initial_device:
+        model.overrides["device"] = initial_device
+    return model
 
 
 def _parse_args() -> argparse.Namespace:
@@ -201,17 +321,26 @@ def _parse_args() -> argparse.Namespace:
         description="Preview detect-depth-grasp path from Gemini335 RGB-D in RViz."
     )
     hidden = argparse.SUPPRESS
-    parser.add_argument("--model", default="yolo_workspace/weights/yolo26n.pt", help=hidden)
+    parser.add_argument(
+        "--model", default="yolo_workspace/weights/trash_yolo26n_seg_best.pt", help=hidden
+    )
     parser.add_argument("--venv", default="yolo_workspace/.venv", help=hidden)
-    parser.add_argument("--classes", default="bottle")
+    parser.add_argument("--yolo-task", default="segment", help=hidden)
+    parser.add_argument("--classes", default="trash")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--imgsz", type=int, default=640, help=hidden)
     parser.add_argument("--device-id", default="0", help=hidden)
+    parser.add_argument(
+        "--onnx-device",
+        default=os.environ.get("ARACHNE_GRASP_ONNX_DEVICE", "cpu"),
+        help=hidden,
+    )
     parser.add_argument("--gripper-type", choices=("ms42dc", "ag95"), default="ms42dc", help=hidden)
     parser.add_argument("--inference-period", type=float, default=0.45, help=hidden)
     parser.add_argument("--snapshot-iou-threshold", type=float, default=0.35, help=hidden)
     parser.add_argument("--snapshot-center-shift", type=float, default=0.12, help=hidden)
     parser.add_argument("--lost-frame-threshold", type=int, default=5, help=hidden)
+    parser.add_argument("--locked-visual-rate", type=float, default=10.0, help=hidden)
     parser.add_argument("--restart-search-topic", default="/arachne/grasp_preview/restart_search")
     parser.add_argument("--joint-states-topic", default="/arachne/display/joint_states", help=hidden)
     parser.add_argument("--color-topic", default="/camera/color/image_raw", help=hidden)
@@ -253,8 +382,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--approach-distance", type=float, default=0.18, help=hidden)
     parser.add_argument("--grasp-standoff", type=float, default=0.035, help=hidden)
-    parser.add_argument("--grasp-tcp-offset-m", type=float, default=0.12, help=hidden)
-    parser.add_argument("--grasp-base-offset", default="0.06,0.09,-0.10", help=hidden)
+    parser.add_argument("--grasp-tcp-offset-m", type=float, default=0.0, help=hidden)
+    parser.add_argument("--grasp-base-offset", default="0,0,0", help=hidden)
+    parser.add_argument("--disable-pointcloud-grasp-shape", action="store_true", help=hidden)
+    parser.add_argument("--vertical-approach", action=argparse.BooleanOptionalAction, default=True, help=hidden)
+    parser.add_argument(
+        "--lock-grasp-orientation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=hidden,
+    )
+    parser.add_argument("--pointcloud-grasp-min-points", type=int, default=24, help=hidden)
+    parser.add_argument("--pointcloud-axis-confidence-threshold", type=float, default=0.10, help=hidden)
+    parser.add_argument("--visual-axis-confidence-threshold", type=float, default=0.12, help=hidden)
+    parser.add_argument("--pointcloud-visible-upper-half-z-bias-ratio", type=float, default=0.25, help=hidden)
+    parser.add_argument("--pointcloud-visible-upper-half-z-bias-max", type=float, default=0.025, help=hidden)
     parser.add_argument("--lift-distance", type=float, default=0.10, help=hidden)
     parser.add_argument("--base-frame", default="base_link", help=hidden)
     parser.add_argument("--aubo-base-frame", default="grasp_preview_aubo_base_link", help=hidden)
@@ -262,14 +404,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--basket-approach-base", default="0.545,0.0,0.34", help=hidden)
     parser.add_argument("--basket-keepout-min-base", default="0.4215,-0.11,-0.1235", help=hidden)
     parser.add_argument("--basket-keepout-max-base", default="0.6655,0.11,0.0635", help=hidden)
+    parser.add_argument("--rear-rack-keepout-min-base", default="-0.41,-0.22,0.04", help=hidden)
+    parser.add_argument("--rear-rack-keepout-max-base", default="0.09,0.22,0.82", help=hidden)
     parser.add_argument("--basket-clearance", type=float, default=0.04, help=hidden)
     parser.add_argument("--gripper-radius", type=float, default=0.055, help=hidden)
-    parser.add_argument("--arm-collision-radius", type=float, default=0.075, help=hidden)
-    parser.add_argument("--arm-collision-samples-per-link", type=int, default=8, help=hidden)
-    parser.add_argument("--collision-margin", type=float, default=0.035, help=hidden)
+    parser.add_argument("--arm-collision-radius", type=float, default=0.035, help=hidden)
+    parser.add_argument("--arm-collision-samples-per-link", type=int, default=6, help=hidden)
+    parser.add_argument("--collision-margin", type=float, default=0.015, help=hidden)
+    parser.add_argument("--rear-rack-collision-margin", type=float, default=0.005, help=hidden)
+    parser.add_argument("--ground-min-z-base", type=float, default=-0.22, help=hidden)
+    parser.add_argument("--ground-clearance", type=float, default=0.02, help=hidden)
+    parser.add_argument("--tool-ground-clearance", type=float, default=0.015, help=hidden)
     parser.add_argument("--allow-colliding-best-effort", action="store_true", help=hidden)
     parser.add_argument("--release-tool-tilt-deg", type=float, default=12.0, help=hidden)
     parser.add_argument("--transit-height", type=float, default=0.36, help=hidden)
+    parser.add_argument("--safe-mid-lift-height", type=float, default=0.50, help=hidden)
     parser.add_argument("--transit-arc-height", type=float, default=0.16, help=hidden)
     parser.add_argument("--arc-samples", type=int, default=24, help=hidden)
     parser.add_argument("--line-samples", type=int, default=6, help=hidden)
@@ -280,7 +429,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-joint-tolerance", type=float, default=0.004, help=hidden)
     parser.add_argument("--trajectory-max-duration", type=float, default=90.0, help=hidden)
     parser.add_argument("--planning-key-waypoints", default="approach,grasp,safe_mid,basket_over", help=hidden)
-    parser.add_argument("--planner-backend", choices=("moveit", "local"), default="moveit", help=hidden)
+    parser.add_argument("--planner-backend", choices=("moveit", "remote", "local", "none"), default="local", help=hidden)
+    parser.add_argument(
+        "--remote-planner-url",
+        default=os.environ.get("ARACHNE_REMOTE_PLANNER_URL", "http://127.0.0.1:8767"),
+        help=hidden,
+    )
+    parser.add_argument("--remote-planner-timeout", type=float, default=2.0, help=hidden)
     parser.add_argument("--moveit-plan-service", default="/plan_kinematic_path", help=hidden)
     parser.add_argument(
         "--moveit-planners",
@@ -303,6 +458,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--moveit-local-fallback-orientation-tolerance", type=float, default=0.50, help=hidden)
     parser.add_argument("--moveit-grasp-fallback-position-tolerance", type=float, default=0.12, help=hidden)
     parser.add_argument("--moveit-grasp-fallback-orientation-tolerance", type=float, default=0.65, help=hidden)
+    parser.add_argument("--moveit-pose-goal-on-ik-failure", action=argparse.BooleanOptionalAction, default=True, help=hidden)
+    parser.add_argument(
+        "--local-strict-ik",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=hidden,
+    )
+    parser.add_argument("--local-position-tolerance", type=float, default=0.035, help=hidden)
+    parser.add_argument("--local-orientation-tolerance", type=float, default=0.35, help=hidden)
+    parser.add_argument(
+        "--moveit-local-first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=hidden,
+    )
     parser.add_argument("--gripper-close-progress-start", type=float, default=0.30, help=hidden)
     parser.add_argument("--gripper-close-progress-end", type=float, default=0.42, help=hidden)
     parser.add_argument("--gripper-open-progress-start", type=float, default=0.84, help=hidden)
@@ -347,7 +517,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--real-sdk-ip", default=os.environ.get("AUBO_ROBOT_IP", "192.168.127.128"), help=hidden)
     parser.add_argument("--real-sdk-rpc-port", type=int, default=30004, help=hidden)
     parser.add_argument("--real-sdk-rpc-timeout", type=float, default=2.0, help=hidden)
-    parser.add_argument("--real-sdk-teach-flag-path", default="/tmp/arachne_aubo_teach_mode", help=hidden)
+    parser.add_argument("--real-sdk-teach-flag-path", default=DEFAULT_AUBO_TEACH_FLAG_PATH, help=hidden)
+    parser.add_argument(
+        "--real-sdk-control-owner-path",
+        default=DEFAULT_AUBO_CONTROL_OWNER_PATH,
+        help=hidden,
+    )
+    parser.add_argument(
+        "--real-sdk-control-owner-name",
+        default="grasp_task_server",
+        help=hidden,
+    )
     parser.add_argument("--real-sdk-gate-settle-sec", type=float, default=0.12, help=hidden)
     parser.add_argument("--real-sdk-move-speed", type=float, default=0.25, help=hidden)
     parser.add_argument("--real-sdk-move-accel", type=float, default=0.45, help=hidden)
@@ -357,7 +537,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--real-sdk-goal-tolerance-rad", type=float, default=0.045, help=hidden)
     parser.add_argument("--real-sdk-arrival-timeout-padding", type=float, default=5.0, help=hidden)
     parser.add_argument("--real-sdk-max-segment-joint-delta", type=float, default=0.55, help=hidden)
-    parser.add_argument("--real-sdk-max-targets", type=int, default=18, help=hidden)
+    parser.add_argument("--real-sdk-max-targets", type=int, default=8, help=hidden)
+    parser.add_argument("--real-sdk-semantic-targets-only", action=argparse.BooleanOptionalAction, default=True, help=hidden)
     parser.add_argument(
         "--real-return-home",
         dest="real_return_home",
@@ -394,7 +575,28 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--real-gripper-command-topic", default="/arachne/gripper/command", help=hidden)
     parser.add_argument("--real-gripper-settle-sec", type=float, default=0.35, help=hidden)
-    parser.add_argument("--tool-orientation-limit-deg", type=float, default=30.0, help=hidden)
+    parser.add_argument("--real-gripper-status-topic", default="/arachne/hardware/gripper_status", help=hidden)
+    parser.add_argument(
+        "--real-gripper-require-capture",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=hidden,
+    )
+    parser.add_argument("--real-gripper-capture-timeout", type=float, default=1.2, help=hidden)
+    parser.add_argument("--real-gripper-capture-min-angle", type=float, default=450.0, help=hidden)
+    parser.add_argument("--real-gripper-empty-close-angle", type=float, default=350.0, help=hidden)
+    parser.add_argument(
+        "--real-gripper-capture-unknown-ok",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=hidden,
+    )
+    parser.add_argument("--tool-orientation-limit-deg", type=float, default=35.0, help=hidden)
+    parser.add_argument("--grasp-topdown-max-tilt-deg", type=float, default=65.0, help=hidden)
+    parser.add_argument("--max-grasp-orientation-candidates", type=int, default=8, help=hidden)
+    parser.add_argument("--grasp-orientation-yaw-offsets-deg", default="0,20,-20,35,-35", help=hidden)
+    parser.add_argument("--transit-orientation-yaw-offsets-deg", default="0,25,-25,35,-35", help=hidden)
+    parser.add_argument("--grasp-orientation-tilt-offsets-deg", default="0,15,-15", help=hidden)
     parser.add_argument("--moveit-use-orientation-path-constraint", action="store_true", help=hidden)
     parser.add_argument("--moveit-max-tool0-reach", type=float, default=1.03, help=hidden)
     parser.add_argument("--moveit-velocity-scale", type=float, default=0.50, help=hidden)
@@ -461,6 +663,17 @@ def _float_values(value: str, expected: int, label: str) -> list[float]:
     ]
     if len(parts) != expected:
         raise ValueError(f"{label} must contain {expected} values, got {len(parts)}")
+    return [float(part) for part in parts]
+
+
+def _float_list(value: str, label: str) -> list[float]:
+    parts = [
+        part.strip()
+        for part in str(value).replace(";", ",").replace(" ", ",").split(",")
+        if part.strip()
+    ]
+    if not parts:
+        raise ValueError(f"{label} must contain at least one value")
     return [float(part) for part in parts]
 
 
@@ -534,7 +747,14 @@ class GraspPreviewNode(Node):
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.model = _load_yolo(self.venv, self.model_path)
+        initial_device = (
+            str(args.onnx_device).strip()
+            if self.model_path.suffix.lower() == ".onnx"
+            else str(args.device_id)
+        )
+        self.model = _load_yolo(
+            self.venv, self.model_path, str(args.yolo_task), initial_device
+        )
         self.class_ids = _class_ids(self.model, args.classes)
         self.base_frame = str(args.base_frame)
         self.aubo_base_frame = str(args.aubo_base_frame)
@@ -543,6 +763,8 @@ class GraspPreviewNode(Node):
         self.basket_approach_base = _xyz(args.basket_approach_base)
         self.basket_keepout_min = _xyz(args.basket_keepout_min_base)
         self.basket_keepout_max = _xyz(args.basket_keepout_max_base)
+        self.rear_rack_keepout_min = _xyz(args.rear_rack_keepout_min_base)
+        self.rear_rack_keepout_max = _xyz(args.rear_rack_keepout_max_base)
         self._clamp_basket_points_above_keepout()
         self.collision_boxes = self._make_collision_boxes()
         self.kinematics = AuboI5Kinematics()
@@ -582,6 +804,8 @@ class GraspPreviewNode(Node):
         self.plan_lock_time = 0.0
         self.tool_to_grasp_matrix: np.ndarray | None = None
         self.tool_to_grasp_frames: tuple[str, str] | None = None
+        self.gripper_status_lock = threading.Lock()
+        self.latest_real_gripper_status: tuple[float, str] | None = None
         self.locked_visual_last_publish = 0.0
         self.missing_frames = 0
         self.last_log_time = 0.0
@@ -600,6 +824,12 @@ class GraspPreviewNode(Node):
                 args.real_joint_states_topic,
                 self._real_joint_state_cb,
                 qos_profile_sensor_data,
+            )
+            self.create_subscription(
+                String,
+                args.real_gripper_status_topic,
+                self._real_gripper_status_cb,
+                10,
             )
         self.moveit_plan_client = (
             self.create_client(GetMotionPlan, str(args.moveit_plan_service))
@@ -637,6 +867,9 @@ class GraspPreviewNode(Node):
         self.get_logger().info(
             "grasp preview ready: "
             f"model={self.model_path} classes={args.classes or 'all'} "
+            f"inference_device={self._yolo_device()} "
+            f"planner={args.planner_backend} vertical_approach={bool(args.vertical_approach)} "
+            f"lock_orientation={bool(args.lock_grasp_orientation)} "
             "markers=/arachne/grasp_preview/markers "
             "roi_cloud=/arachne/grasp_preview/roi_cloud "
             f"restart_topic={args.restart_search_topic}"
@@ -662,29 +895,49 @@ class GraspPreviewNode(Node):
     def _make_collision_boxes(self) -> list[CollisionBox]:
         margin = max(float(self.args.collision_margin), 0.0)
 
-        def padded(size: tuple[float, float, float]) -> tuple[float, float, float]:
-            return tuple(float(value) + 2.0 * margin for value in size)  # type: ignore[return-value]
+        def padded(
+            size: tuple[float, float, float], margin_m: float = margin
+        ) -> tuple[float, float, float]:
+            pad = max(float(margin_m), 0.0)
+            return tuple(float(value) + 2.0 * pad for value in size)  # type: ignore[return-value]
 
-        basket_center = (
-            0.5 * (self.basket_keepout_min[0] + self.basket_keepout_max[0]),
-            0.5 * (self.basket_keepout_min[1] + self.basket_keepout_max[1]),
-            0.5 * (self.basket_keepout_min[2] + self.basket_keepout_max[2]),
+        def box_from_min_max(
+            name: str,
+            minimum: tuple[float, float, float],
+            maximum: tuple[float, float, float],
+            margin_m: float = margin,
+        ) -> CollisionBox | None:
+            mins = np.asarray(minimum, dtype=np.float64)
+            maxs = np.asarray(maximum, dtype=np.float64)
+            if bool(np.any(maxs <= mins)):
+                return None
+            center = tuple(float(value) for value in (mins + maxs) * 0.5)
+            size = tuple(float(value) for value in (maxs - mins))
+            return CollisionBox(name, center, padded(size, margin_m))
+
+        basket_box = box_from_min_max(
+            "front_basket_keepout", self.basket_keepout_min, self.basket_keepout_max
         )
-        basket_size = (
-            self.basket_keepout_max[0] - self.basket_keepout_min[0],
-            self.basket_keepout_max[1] - self.basket_keepout_min[1],
-            self.basket_keepout_max[2] - self.basket_keepout_min[2],
+        rear_box = box_from_min_max(
+            "rear_sensor_rack",
+            self.rear_rack_keepout_min,
+            self.rear_rack_keepout_max,
+            max(float(self.args.rear_rack_collision_margin), 0.0),
         )
-        return [
+        boxes = [
             CollisionBox("scout_base_main", (0.0, 0.0, 0.008), padded((0.925, 0.380, 0.210))),
             CollisionBox(
                 "scout_base_center_ridge",
                 (0.0, 0.0, 0.210 / 6.0),
                 padded((0.925 / 6.0, 0.380 * 1.65, 0.210 / 3.0)),
             ),
-            CollisionBox("front_basket_keepout", basket_center, padded(basket_size)),
             CollisionBox("arm_mount", (0.22, 0.0, 0.155 - 0.025), padded((0.26, 0.22, 0.05))),
         ]
+        if basket_box is not None:
+            boxes.append(basket_box)
+        if rear_box is not None:
+            boxes.append(rear_box)
+        return boxes
 
     def _color_cb(self, msg: Image) -> None:
         self.latest_color = msg
@@ -717,6 +970,10 @@ class GraspPreviewNode(Node):
             if index < len(msg.position):
                 self.real_joint_positions[name] = float(msg.position[index])
         self.real_joint_state_time = time.monotonic()
+
+    def _real_gripper_status_cb(self, msg: String) -> None:
+        with self.gripper_status_lock:
+            self.latest_real_gripper_status = (time.monotonic(), str(msg.data))
 
     def _moveit_start_state_joint_values(self, q_start: np.ndarray) -> tuple[list[str], list[float]]:
         joint_values: dict[str, float] = {
@@ -795,7 +1052,8 @@ class GraspPreviewNode(Node):
             return
         if self.inference_paused and self.last_preview is not None:
             now = time.monotonic()
-            if now - self.locked_visual_last_publish < 0.5:
+            locked_period = 1.0 / max(float(self.args.locked_visual_rate), 1.0)
+            if now - self.locked_visual_last_publish < locked_period:
                 return
             try:
                 color = _image_to_bgr(self.latest_color)
@@ -958,6 +1216,9 @@ class GraspPreviewNode(Node):
     ) -> None:
         x1, y1, x2, y2 = (int(round(v)) for v in detection.xyxy)
         cv2.rectangle(image, (x1, y1), (x2, y2), (0, 190, 255), 2)
+        if detection.mask_xy:
+            polygon = np.asarray(detection.mask_xy, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(image, [polygon], isClosed=True, color=(0, 255, 80), thickness=2)
         cv2.putText(
             image,
             f"{prefix} {detection.label} {detection.confidence:.2f}",
@@ -1003,6 +1264,18 @@ class GraspPreviewNode(Node):
         self.image_pub.publish(_image_from_bgr(annotated, header))
 
     def _start_arm_planning(self, preview: GraspPreview, preview_header: Header) -> None:
+        if str(self.args.planner_backend) == "none":
+            perception = replace(
+                preview,
+                base_path_xyz=self._sample_trajectory_for_display(preview.base_trajectory_segments),
+                ik_message="perception_only: shape target ready; planning skipped",
+            )
+            self.last_preview = perception
+            self.preview_ik_message = perception.ik_message
+            self.plan_lock_time = time.monotonic()
+            self._publish_preview(perception, preview_header)
+            self.get_logger().info("3D snapshot published; arm planning skipped")
+            return
         with self.planning_lock:
             if self.planning_thread is not None and self.planning_thread.is_alive():
                 return
@@ -1021,7 +1294,12 @@ class GraspPreviewNode(Node):
         self, generation: int, preview: GraspPreview, preview_header: Header
     ) -> None:
         start = time.monotonic()
-        arm_frames, ik_message = self._make_constrained_arm_trajectory(preview)
+        try:
+            arm_frames, ik_message = self._make_constrained_arm_trajectory(preview)
+        except Exception as exc:
+            arm_frames = []
+            ik_message = f"planning exception: {type(exc).__name__}: {exc}"
+            self.get_logger().error(ik_message)
         if self.stopping or not rclpy.ok():
             return
         planned_path = self._arm_trajectory_grasp_path_base(arm_frames) if arm_frames else []
@@ -1117,6 +1395,7 @@ class GraspPreviewNode(Node):
         accel = max(float(self.args.real_sdk_move_accel), 0.05)
         blend_radius = max(float(self.args.real_sdk_blend_radius), 0.0)
         duration_scale = max(float(self.args.real_sdk_segment_duration_scale), 0.0)
+        owner_owned = False
         gate_owned = False
         self.get_logger().warn(
             f"sending REAL arm motion through Aubo SDK moveJoint: targets={len(targets)} "
@@ -1124,9 +1403,10 @@ class GraspPreviewNode(Node):
         )
 
         with AuboDirectJsonRpc(ip, port, timeout) as rpc:
-            self._real_sdk_require_running(rpc)
-            gate_owned = self._real_sdk_enter_gate()
             try:
+                self._real_sdk_require_running(rpc)
+                owner_owned = self._real_sdk_enter_control_owner()
+                gate_owned = self._real_sdk_enter_gate()
                 self._real_sdk_exit_servo_mode(rpc)
                 self._real_sdk_stop_joint(rpc, "pre-move cleanup", warn_only=True)
                 if bool(self.args.real_execute_gripper):
@@ -1139,9 +1419,9 @@ class GraspPreviewNode(Node):
                 closed = False
                 opened = False
                 (
-                    close_start,
+                    _close_start,
                     _close_end,
-                    open_start,
+                    _open_start,
                     _open_end,
                     close_label,
                     open_label,
@@ -1170,16 +1450,16 @@ class GraspPreviewNode(Node):
                     self._real_sdk_wait_arrival(rpc, np.asarray(target, dtype=float), label, segment_dt)
                     previous_time = float(frame.time_from_start)
 
-                    progress = self._real_frame_progress(frames, frame)
                     if bool(self.args.real_execute_gripper) and not closed:
-                        if label == close_label or progress >= close_start:
+                        if label == close_label:
                             self._publish_real_gripper("close")
                             closed = True
                             settle = max(float(self.args.real_gripper_settle_sec), 0.0)
                             if settle > 0.0:
                                 time.sleep(settle)
+                            self._require_real_gripper_capture_or_raise()
                     if bool(self.args.real_execute_gripper) and not opened:
-                        if label == open_label or progress >= open_start:
+                        if label == open_label:
                             self._publish_real_gripper("open")
                             opened = True
                             settle = max(float(self.args.real_gripper_settle_sec), 0.0)
@@ -1189,9 +1469,11 @@ class GraspPreviewNode(Node):
                     self.get_logger().warn("REAL arm SDK moveJoint sequence complete")
             finally:
                 try:
-                    self._real_sdk_stop_joint(rpc, "post-move cleanup", warn_only=True)
+                    if gate_owned:
+                        self._real_sdk_stop_joint(rpc, "post-move cleanup", warn_only=True)
                 finally:
                     self._real_sdk_exit_gate(gate_owned)
+                    self._real_sdk_exit_control_owner(owner_owned)
 
     def _execute_real_follow_joint_trajectory(self, preview: GraspPreview) -> None:
         if self.real_arm_action_client is None:
@@ -1200,17 +1482,64 @@ class GraspPreviewNode(Node):
         if not self.real_arm_action_client.wait_for_server(timeout_sec=2.0):
             raise TimeoutError(f"real arm action server unavailable: {action_name}")
 
-        trajectory = self._real_joint_trajectory_msg(preview.arm_trajectory_frames)
-        duration = float(preview.arm_trajectory_frames[-1].time_from_start)
+        frames = preview.arm_trajectory_frames
+        if not bool(self.args.real_execute_gripper):
+            self._send_real_follow_joint_segment(frames, 0, len(frames) - 1, "full")
+            self.get_logger().warn("REAL arm trajectory complete")
+            return
+
+        close_start, _close_end, open_start, _open_end, _close_label, _open_label = (
+            self._gripper_event_progresses(preview)
+        )
+        semantic_indices = self._real_sdk_semantic_frame_indices(preview, frames)
+        close_index = semantic_indices.get(str(self.args.gripper_close_waypoint).strip())
+        open_index = semantic_indices.get(str(self.args.gripper_open_waypoint).strip())
+        if close_index is None:
+            close_index = self._frame_index_at_or_after(
+                frames, float(frames[-1].time_from_start) * close_start
+            )
+        if open_index is None:
+            open_index = self._frame_index_at_or_after(
+                frames, float(frames[-1].time_from_start) * open_start
+            )
+        close_index = min(max(int(close_index), 1), len(frames) - 1)
+        open_index = min(max(int(open_index), close_index), len(frames) - 1)
+
+        self._publish_real_gripper("open")
+        settle = max(float(self.args.real_gripper_settle_sec), 0.0)
+        if settle > 0.0:
+            time.sleep(settle)
+        self._send_real_follow_joint_segment(frames, 0, close_index, "to_grasp")
+        self._publish_real_gripper("close")
+        if settle > 0.0:
+            time.sleep(settle)
+        self._require_real_gripper_capture_or_raise()
+        self._send_real_follow_joint_segment(frames, close_index, open_index, "to_release")
+        self._publish_real_gripper("open")
+        if settle > 0.0:
+            time.sleep(settle)
+        self._send_real_follow_joint_segment(frames, open_index, len(frames) - 1, "finish")
+        self.get_logger().warn("REAL arm trajectory complete")
+
+    def _send_real_follow_joint_segment(
+        self,
+        frames: list[JointTrajectoryFrame],
+        start_index: int,
+        end_index: int,
+        label: str,
+    ) -> None:
+        start_index = min(max(int(start_index), 0), len(frames) - 1)
+        end_index = min(max(int(end_index), start_index), len(frames) - 1)
+        if end_index <= start_index:
+            return
+        segment = self._rebased_trajectory_frames(frames[start_index : end_index + 1])
+        trajectory = self._real_joint_trajectory_msg(segment)
+        duration = float(segment[-1].time_from_start)
+        action_name = str(self.args.real_follow_action)
         self.get_logger().warn(
-            f"sending REAL arm trajectory: points={len(trajectory.points)} "
+            f"sending REAL arm trajectory segment {label}: points={len(trajectory.points)} "
             f"duration={duration:.2f}s action={action_name}"
         )
-        if bool(self.args.real_execute_gripper):
-            self._publish_real_gripper("open")
-            settle = max(float(self.args.real_gripper_settle_sec), 0.0)
-            if settle > 0.0:
-                time.sleep(settle)
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = trajectory
@@ -1220,39 +1549,22 @@ class GraspPreviewNode(Node):
 
         goal_future = self.real_arm_action_client.send_goal_async(goal)
         if not self._wait_future(goal_future, 3.0):
-            raise TimeoutError("real arm action goal response timed out")
+            raise TimeoutError(f"real arm action segment {label} goal response timed out")
         goal_handle = goal_future.result()
         if goal_handle is None or not goal_handle.accepted:
-            raise RuntimeError("real arm action goal rejected")
+            raise RuntimeError(f"real arm action segment {label} goal rejected")
 
         result_future = goal_handle.get_result_async()
         start = time.monotonic()
-        closed = False
-        opened = False
-        (
-            close_start,
-            _close_end,
-            open_start,
-            _open_end,
-            _close_label,
-            _open_label,
-        ) = self._gripper_event_progresses(preview)
         timeout = duration + max(float(self.args.real_action_timeout_padding), 0.0)
         while rclpy.ok() and not self.stopping and not result_future.done():
             elapsed = time.monotonic() - start
-            progress = min(max(elapsed / max(duration, 1e-6), 0.0), 1.0)
-            if bool(self.args.real_execute_gripper) and not closed:
-                if progress >= close_start:
-                    self._publish_real_gripper("close")
-                    closed = True
-            if bool(self.args.real_execute_gripper) and not opened:
-                if progress >= open_start:
-                    self._publish_real_gripper("open")
-                    opened = True
             if elapsed > timeout:
                 cancel_future = goal_handle.cancel_goal_async()
                 self._wait_future(cancel_future, 1.0)
-                raise TimeoutError(f"real arm action result timed out after {elapsed:.2f}s")
+                raise TimeoutError(
+                    f"real arm action segment {label} result timed out after {elapsed:.2f}s"
+                )
             time.sleep(0.02)
 
         if self.stopping or not rclpy.ok():
@@ -1260,12 +1572,12 @@ class GraspPreviewNode(Node):
         result_response = result_future.result()
         result = result_response.result if result_response is not None else None
         if result is None:
-            raise RuntimeError("real arm action returned empty result")
+            raise RuntimeError(f"real arm action segment {label} returned empty result")
         if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
             raise RuntimeError(
-                f"real arm action failed: code={result.error_code} {result.error_string}"
+                f"real arm action segment {label} failed: "
+                f"code={result.error_code} {result.error_string}"
             )
-        self.get_logger().warn("REAL arm trajectory complete")
 
     def _real_sdk_move_targets(
         self, preview: GraspPreview, frames: list[JointTrajectoryFrame]
@@ -1275,26 +1587,64 @@ class GraspPreviewNode(Node):
         close_start, _close_end, open_start, _open_end, close_label, open_label = (
             self._gripper_event_progresses(preview)
         )
-        event_progresses = [(close_label, close_start), (open_label, open_start)]
+        semantic_indices = self._real_sdk_semantic_frame_indices(preview, frames)
+        close_index = semantic_indices.get(str(self.args.gripper_close_waypoint).strip())
+        open_index = semantic_indices.get(str(self.args.gripper_open_waypoint).strip())
+        if close_index is None:
+            close_index = self._frame_index_at_or_after(
+                frames, float(frames[-1].time_from_start) * close_start
+            )
+        if open_index is None:
+            open_index = self._frame_index_at_or_after(
+                frames, float(frames[-1].time_from_start) * open_start
+            )
+        close_index = min(max(int(close_index), 1), len(frames) - 1)
+        open_index = min(max(int(open_index), close_index), len(frames) - 1)
+        if open_index <= close_index and close_index < len(frames) - 1:
+            open_index = close_index + 1
         selected: dict[int, str] = {}
-        for label, progress in event_progresses:
-            target_time = float(frames[-1].time_from_start) * progress
-            index = self._frame_index_at_or_after(frames, target_time)
-            selected[index] = label
+        planned_names = {
+            name for name, _point, _progress in self._planning_target_samples(preview)
+        }
+        semantic_labels = {
+            "approach": "approach",
+            "grasp": close_label,
+            "safe_mid": "safe_mid",
+            "basket_over": open_label,
+            "drop": "drop",
+        }
+        for name, label in semantic_labels.items():
+            if name not in planned_names:
+                continue
+            index = semantic_indices.get(name)
+            if index is not None and index > 0:
+                if name == "grasp":
+                    index = close_index
+                elif name == str(self.args.gripper_open_waypoint).strip():
+                    index = open_index
+                selected[min(max(int(index), 1), len(frames) - 1)] = label
+        selected[close_index] = close_label
+        selected[open_index] = open_label
 
         max_delta = max(float(self.args.real_sdk_max_segment_joint_delta), 0.05)
         max_targets = max(int(self.args.real_sdk_max_targets), 2)
-        last_q = np.asarray(frames[0].positions, dtype=float)
-        for index, frame in enumerate(frames[1:], start=1):
-            if index in selected:
-                last_q = np.asarray(frame.positions, dtype=float)
-                continue
-            delta = float(np.max(np.abs(self._joint_delta(np.asarray(frame.positions, dtype=float), last_q))))
-            if delta >= max_delta:
-                selected[index] = f"segment_{len(selected) + 1}"
-                last_q = np.asarray(frame.positions, dtype=float)
-            if len(selected) >= max_targets:
-                break
+        if not bool(self.args.real_sdk_semantic_targets_only):
+            last_q = np.asarray(frames[0].positions, dtype=float)
+            safe_mid_index = semantic_indices.get("safe_mid", open_index)
+            for index, frame in enumerate(frames[1:], start=1):
+                if index in selected:
+                    last_q = np.asarray(frame.positions, dtype=float)
+                    continue
+                if close_index < index < safe_mid_index:
+                    continue
+                delta = float(
+                    np.max(np.abs(self._joint_delta(np.asarray(frame.positions, dtype=float), last_q)))
+                )
+                if delta >= max_delta:
+                    selected[index] = f"segment_{len(selected) + 1}"
+                    last_q = np.asarray(frame.positions, dtype=float)
+                if len(selected) >= max_targets:
+                    break
 
         if (len(frames) - 1) not in selected:
             selected[len(frames) - 1] = "final"
@@ -1303,7 +1653,7 @@ class GraspPreviewNode(Node):
             keep = {
                 index
                 for index, label in ordered
-                if label in {close_label, open_label, "final"}
+                if label in {close_label, open_label, "safe_mid", "final"}
             }
             remaining = [index for index, _label in ordered if index not in keep]
             budget = max(max_targets - len(keep), 0)
@@ -1315,6 +1665,58 @@ class GraspPreviewNode(Node):
         if bool(self.args.real_return_home):
             targets.append(("home", self._real_home_frame(frames[-1])))
         return targets
+
+    def _real_sdk_semantic_frame_indices(
+        self, preview: GraspPreview, frames: list[JointTrajectoryFrame]
+    ) -> dict[str, int]:
+        waypoint_map = {name: xyz for name, xyz in preview.base_waypoints}
+        planned_names = {
+            name for name, _point, _progress in self._planning_target_samples(preview)
+        }
+        names = [
+            name
+            for name in ["approach", "grasp", "safe_mid", "basket_over", "drop"]
+            if name in planned_names
+        ]
+        targets = {name: waypoint_map[name] for name in names if name in waypoint_map}
+        if not targets:
+            return {}
+        tool_to_grasp, _message = self._tool_to_grasp_matrix()
+        if tool_to_grasp is None:
+            return {}
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                self.aubo_base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.05),
+            )
+        except TransformException:
+            return {}
+        base_from_aubo = self._matrix_from_transform(transform)
+        grasp_points = []
+        for frame in frames:
+            tool_in_aubo = self.kinematics.fk(np.asarray(frame.positions, dtype=float))
+            grasp_in_base = base_from_aubo @ tool_in_aubo @ tool_to_grasp
+            grasp_points.append(np.asarray(grasp_in_base[:3, 3], dtype=float))
+        result: dict[str, int] = {}
+        previous_index = 1
+        for name in names:
+            target = targets.get(name)
+            if target is None:
+                continue
+            target_vec = np.asarray(target, dtype=float)
+            start = min(max(previous_index, 1), len(frames) - 1)
+            distances = [
+                float(np.linalg.norm(point - target_vec)) if index >= start else float("inf")
+                for index, point in enumerate(grasp_points)
+            ]
+            index = int(np.argmin(distances))
+            if not np.isfinite(distances[index]):
+                continue
+            result[name] = index
+            previous_index = min(max(index + 1, previous_index), len(frames) - 1)
+        return result
 
     def _real_home_frame(self, previous_frame: JointTrajectoryFrame) -> JointTrajectoryFrame:
         positions = tuple(_float_values(str(self.args.real_home_joints), 6, "--real-home-joints"))
@@ -1369,13 +1771,38 @@ class GraspPreviewNode(Node):
     def _real_sdk_enter_gate(self) -> bool:
         path = Path(str(self.args.real_sdk_teach_flag_path))
         if path.exists():
-            self.get_logger().warn(f"real SDK teach gate already active: {path}")
-            return False
-        path.write_text("grasp_preview_sdk_move_joint\n", encoding="utf-8")
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError as exc:
+                raise RuntimeError(f"real SDK teach gate is unreadable: {path}: {exc}") from exc
+            raise RuntimeError(
+                "real SDK teach gate is already active; turn teach/jog off before grasp "
+                f"path={path} value={text!r}"
+            )
+        path.write_text("1\n", encoding="utf-8")
         settle = max(float(self.args.real_sdk_gate_settle_sec), 0.0)
         if settle > 0.0:
             time.sleep(settle)
         return True
+
+    def _real_sdk_enter_control_owner(self) -> bool:
+        path = Path(str(self.args.real_sdk_control_owner_path))
+        owner = str(self.args.real_sdk_control_owner_name).strip() or "grasp_task_server"
+        ok, message = _claim_control_owner(path, owner)
+        if not ok:
+            raise RuntimeError(
+                "Aubo control is busy; stop teach/manual jog before real grasp: "
+                f"{message}"
+            )
+        self.get_logger().warn(f"REAL Aubo control owner acquired: {message}")
+        return True
+
+    def _real_sdk_exit_control_owner(self, owner_owned: bool) -> None:
+        if not owner_owned:
+            return
+        path = Path(str(self.args.real_sdk_control_owner_path))
+        owner = str(self.args.real_sdk_control_owner_name).strip() or "grasp_task_server"
+        _release_control_owner(path, owner)
 
     def _real_sdk_exit_gate(self, gate_owned: bool) -> None:
         if not gate_owned:
@@ -1555,6 +1982,30 @@ class GraspPreviewNode(Node):
             trajectory.points.append(point)
         return trajectory
 
+    def _rebased_trajectory_frames(
+        self, frames: list[JointTrajectoryFrame]
+    ) -> list[JointTrajectoryFrame]:
+        if not frames:
+            return []
+        start_time = float(frames[0].time_from_start)
+        rebased: list[JointTrajectoryFrame] = []
+        for index, frame in enumerate(frames):
+            time_from_start = max(float(frame.time_from_start) - start_time, 0.0)
+            velocities = tuple(float(value) for value in frame.velocities)
+            accelerations = tuple(float(value) for value in frame.accelerations)
+            if index == 0 or index == len(frames) - 1:
+                velocities = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                accelerations = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            rebased.append(
+                JointTrajectoryFrame(
+                    time_from_start,
+                    tuple(float(value) for value in frame.positions),  # type: ignore[arg-type]
+                    velocities,  # type: ignore[arg-type]
+                    accelerations,  # type: ignore[arg-type]
+                )
+            )
+        return rebased
+
     def _publish_real_gripper(self, command: str) -> None:
         if self.real_gripper_pub is None:
             return
@@ -1562,6 +2013,79 @@ class GraspPreviewNode(Node):
         msg.data = command
         self.real_gripper_pub.publish(msg)
         self.get_logger().warn(f"REAL gripper command: {command}")
+
+    def _latest_gripper_status(self) -> tuple[float, str] | None:
+        with self.gripper_status_lock:
+            return self.latest_real_gripper_status
+
+    def _wait_real_gripper_capture(self) -> tuple[bool, str]:
+        if not bool(self.args.real_gripper_require_capture):
+            return True, "capture check disabled"
+        timeout = max(float(self.args.real_gripper_capture_timeout), 0.0)
+        deadline = time.monotonic() + timeout
+        last_status = ""
+        last_decision: tuple[bool | None, str] = (None, "waiting for gripper feedback")
+        while rclpy.ok() and not self.stopping and time.monotonic() <= deadline:
+            self._publish_real_gripper("status")
+            time.sleep(0.12)
+            item = self._latest_gripper_status()
+            if item is None:
+                continue
+            age = time.monotonic() - item[0]
+            if age > max(timeout, 0.5) + 0.5:
+                continue
+            last_status = item[1]
+            decision, message = self._classify_real_gripper_capture(last_status)
+            last_decision = (decision, message)
+            if decision is not None:
+                return bool(decision), message
+        decision, message = last_decision
+        if decision is not None:
+            return bool(decision), message
+        if bool(self.args.real_gripper_capture_unknown_ok):
+            return True, f"capture feedback unknown; assuming captured: {last_status or message}"
+        return False, f"capture feedback unavailable: {last_status or message}"
+
+    def _classify_real_gripper_capture(self, status: str) -> tuple[bool | None, str]:
+        text = str(status).strip()
+        if not text:
+            return None, "empty gripper status"
+        if "feedback_timeout" in text or "feedback_bad_checksum" in text:
+            return None, text
+        reached = self._status_number(text, "reached")
+        speed = self._status_number(text, "speed")
+        angle = self._status_number(text, "angle")
+        if angle is None and reached is None and speed is None:
+            return None, text
+        min_angle = float(self.args.real_gripper_capture_min_angle)
+        empty_angle = float(self.args.real_gripper_empty_close_angle)
+        if reached == 0 and speed == 0:
+            return True, f"gripper early-stop capture: {text}"
+        if angle is not None and angle >= min_angle:
+            return True, f"gripper stopped before empty-close angle: {text}"
+        if reached == 1 and angle is not None and angle <= empty_angle:
+            return False, f"gripper_capture_failed: empty close detected: {text}"
+        if speed is not None and speed > 0:
+            return None, f"gripper still moving: {text}"
+        return None, text
+
+    def _status_number(self, text: str, name: str) -> float | None:
+        match = re.search(rf"\b{name}=(-?\d+(?:\.\d+)?)", text)
+        if match is None:
+            return None
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+
+    def _require_real_gripper_capture_or_raise(self) -> None:
+        ok, message = self._wait_real_gripper_capture()
+        if ok:
+            self.get_logger().warn(f"REAL gripper capture check ok: {message}")
+            return
+        self.get_logger().error(message)
+        self._publish_real_gripper("open")
+        raise RuntimeError(message)
 
     def _draw_locked_detection(self, image: np.ndarray, preview: GraspPreview) -> None:
         self._draw_detection_overlay(image, preview.detection, "LOCKED")
@@ -1588,12 +2112,19 @@ class GraspPreviewNode(Node):
         kwargs = {
             "imgsz": int(self.args.imgsz),
             "conf": float(self.args.conf),
-            "device": str(self.args.device_id),
+            "device": self._yolo_device(),
             "verbose": False,
         }
         if self.class_ids is not None:
             kwargs["classes"] = self.class_ids
         return self.model.predict(frame, **kwargs)[0]
+
+    def _yolo_device(self) -> str:
+        if self.model_path.suffix.lower() == ".onnx":
+            device = str(self.args.onnx_device).strip()
+            if device:
+                return device
+        return str(self.args.device_id)
 
     def _best_detection(self, result) -> Detection | None:
         boxes = result.boxes
@@ -1604,7 +2135,24 @@ class GraspPreviewNode(Node):
         class_id = int(boxes.cls[best_idx].item())
         confidence = float(boxes.conf[best_idx].item())
         label = str(result.names.get(class_id, class_id))
-        return Detection(label=label, class_id=class_id, confidence=confidence, xyxy=xyxy)
+        mask_xy: tuple[tuple[float, float], ...] | None = None
+        mask_area_px = 0.0
+        masks = getattr(result, "masks", None)
+        polygons = getattr(masks, "xy", None) if masks is not None else None
+        if polygons is not None and len(polygons) > best_idx:
+            points = np.asarray(polygons[best_idx], dtype=np.float32)
+            if points.ndim == 2 and points.shape[0] >= 3 and points.shape[1] >= 2:
+                points = points[:, :2]
+                mask_xy = tuple((float(x), float(y)) for x, y in points)
+                mask_area_px = float(abs(cv2.contourArea(points)))
+        return Detection(
+            label=label,
+            class_id=class_id,
+            confidence=confidence,
+            xyxy=xyxy,
+            mask_xy=mask_xy,
+            mask_area_px=mask_area_px,
+        )
 
     def _needs_depth_snapshot(
         self, detection: Detection, image_shape: tuple[int, ...]
@@ -1666,6 +2214,7 @@ class GraspPreviewNode(Node):
         sy = dh / float(ch)
         x1d, x2d = x1 * sx, x2 * sx
         y1d, y2d = y1 * sy, y2 * sy
+        mask_depth = self._detection_depth_mask(detection, dw, dh, cw, ch)
 
         cx = 0.5 * (x1d + x2d)
         cy = 0.5 * (y1d + y2d)
@@ -1677,12 +2226,25 @@ class GraspPreviewNode(Node):
         iy1 = int(np.clip(cy - half_h, 0, dh - 1))
         iy2 = int(np.clip(cy + half_h, iy1 + 1, dh))
         roi = depth[iy1:iy2, ix1:ix2].astype(np.float32) * float(self.args.depth_scale)
-        valid = roi[(roi >= self.args.min_depth) & (roi <= self.args.max_depth)]
+        valid_mask = (roi >= self.args.min_depth) & (roi <= self.args.max_depth)
+        mask_roi = None
+        if mask_depth is not None:
+            candidate = mask_depth[iy1:iy2, ix1:ix2]
+            if int(np.count_nonzero(candidate)) >= 8:
+                mask_roi = candidate
+                valid_mask &= mask_roi
+        roi_source = "mask" if mask_roi is not None else "bbox"
+        valid = roi[valid_mask]
         if valid.size < 8:
             return None
 
         depth_m = float(np.percentile(valid, float(self.args.depth_percentile)))
-        roi_points = self._roi_points(depth, ix1, iy1, ix2, iy2, depth_m)
+        roi_points = self._roi_points(
+            depth, ix1, iy1, ix2, iy2, depth_m, mask_depth if mask_roi is not None else None
+        )
+        visual_axis_camera, visual_axis_confidence = self._detection_visual_axis_camera(
+            detection, depth_m, dw, dh, cw, ch
+        )
         if roi_points:
             arr = np.asarray(roi_points, dtype=np.float32)
             grasp_x, grasp_y, grasp_z = np.median(arr, axis=0).astype(float)
@@ -1704,8 +2266,17 @@ class GraspPreviewNode(Node):
             self._pixel_to_xyz(x2d, y2d, depth_m),
             self._pixel_to_xyz(x1d, y2d, depth_m),
         ]
-        _base_path, base_segments, base_waypoints, base_grasp = self._make_base_path(
-            [pregrasp, grasp, lift, retreat]
+        (
+            _base_path,
+            base_segments,
+            base_waypoints,
+            base_grasp,
+            pointcloud_shape,
+        ) = self._make_base_path(
+            [pregrasp, grasp, lift, retreat],
+            roi_points,
+            visual_axis_camera,
+            visual_axis_confidence,
         )
         return GraspPreview(
             detection=detection,
@@ -1715,25 +2286,53 @@ class GraspPreviewNode(Node):
             lift_xyz=lift,
             retreat_xyz=retreat,
             roi_points=roi_points,
+            roi_source=roi_source,
             bbox_points=bbox_points,
-            base_path_xyz=[],
+            base_path_xyz=_base_path if str(self.args.planner_backend) == "none" else [],
             base_trajectory_segments=base_segments,
             base_waypoints=base_waypoints,
             arm_trajectory_frames=[],
             basket_safe=True,
             base_grasp_xyz=base_grasp,
+            pointcloud_shape=pointcloud_shape,
             snapshot_reason=snapshot_reason,
             ik_message="planning pending",
         )
 
+    def _detection_depth_mask(
+        self, detection: Detection, depth_w: int, depth_h: int, color_w: int, color_h: int
+    ) -> np.ndarray | None:
+        if not detection.mask_xy:
+            return None
+        points = np.asarray(detection.mask_xy, dtype=np.float32)
+        if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] < 2:
+            return None
+        points = points[:, :2].copy()
+        points[:, 0] *= float(depth_w) / max(float(color_w), 1.0)
+        points[:, 1] *= float(depth_h) / max(float(color_h), 1.0)
+        points[:, 0] = np.clip(points[:, 0], 0, max(depth_w - 1, 0))
+        points[:, 1] = np.clip(points[:, 1], 0, max(depth_h - 1, 0))
+        mask = np.zeros((depth_h, depth_w), dtype=np.uint8)
+        cv2.fillPoly(mask, [np.rint(points).astype(np.int32)], 1)
+        return mask.astype(bool)
+
     def _roi_points(
-        self, depth: np.ndarray, x1: int, y1: int, x2: int, y2: int, depth_m: float
+        self,
+        depth: np.ndarray,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        depth_m: float,
+        mask: np.ndarray | None = None,
     ) -> list[tuple[float, float, float]]:
         step = max(int(self.args.roi_decimation), 1)
         points: list[tuple[float, float, float]] = []
         band = max(float(self.args.depth_band), 0.01)
         for y in range(y1, y2, step):
             for x in range(x1, x2, step):
+                if mask is not None and not bool(mask[y, x]):
+                    continue
                 z = float(depth[y, x]) * float(self.args.depth_scale)
                 if z < self.args.min_depth or z > self.args.max_depth:
                     continue
@@ -1741,6 +2340,62 @@ class GraspPreviewNode(Node):
                     continue
                 points.append(self._pixel_to_xyz(float(x), float(y), z))
         return points
+
+    def _detection_visual_axis_camera(
+        self,
+        detection: Detection,
+        depth_m: float,
+        depth_w: int,
+        depth_h: int,
+        color_w: int,
+        color_h: int,
+    ) -> tuple[np.ndarray | None, float]:
+        if detection.mask_xy and len(detection.mask_xy) >= 6:
+            pixels = np.asarray(detection.mask_xy, dtype=np.float64)
+            pixels[:, 0] *= float(depth_w) / max(float(color_w), 1.0)
+            pixels[:, 1] *= float(depth_h) / max(float(color_h), 1.0)
+        else:
+            x1, y1, x2, y2 = detection.xyxy
+            sx = float(depth_w) / max(float(color_w), 1.0)
+            sy = float(depth_h) / max(float(color_h), 1.0)
+            pixels = np.asarray(
+                [
+                    (x1 * sx, y1 * sy),
+                    (x2 * sx, y1 * sy),
+                    (x2 * sx, y2 * sy),
+                    (x1 * sx, y2 * sy),
+                ],
+                dtype=np.float64,
+            )
+        if pixels.ndim != 2 or pixels.shape[0] < 3:
+            return None, 0.0
+        center = np.mean(pixels[:, :2], axis=0)
+        centered = pixels[:, :2] - center
+        cov = np.cov(centered.T)
+        if not np.all(np.isfinite(cov)):
+            return None, 0.0
+        eig_values, eig_vectors = np.linalg.eigh(cov)
+        order = np.argsort(eig_values)[::-1]
+        eig_values = eig_values[order]
+        eig_vectors = eig_vectors[:, order]
+        if float(eig_values[0]) <= 1e-6:
+            return None, 0.0
+        axis_px = eig_vectors[:, 0]
+        axis_px /= max(float(np.linalg.norm(axis_px)), 1e-9)
+        if axis_px[0] < -1e-9 or (abs(axis_px[0]) < 1e-9 and axis_px[1] < 0.0):
+            axis_px *= -1.0
+        spread = np.sqrt(max(float(eig_values[0]), 1.0))
+        delta_px = float(np.clip(spread * 0.35, 6.0, 28.0))
+        p0 = center
+        p1 = center + axis_px * delta_px
+        xyz0 = np.asarray(self._pixel_to_xyz(float(p0[0]), float(p0[1]), depth_m), dtype=float)
+        xyz1 = np.asarray(self._pixel_to_xyz(float(p1[0]), float(p1[1]), depth_m), dtype=float)
+        axis_camera = xyz1 - xyz0
+        norm = float(np.linalg.norm(axis_camera))
+        if norm < 1e-6:
+            return None, 0.0
+        anisotropy = float((eig_values[0] - eig_values[1]) / max(eig_values[0] + eig_values[1], 1e-9))
+        return axis_camera / norm, float(np.clip(anisotropy, 0.0, 1.0))
 
     def _pixel_to_xyz(self, u: float, v: float, z: float) -> tuple[float, float, float]:
         info = self.depth_info
@@ -1768,11 +2423,21 @@ class GraspPreviewNode(Node):
         if now - self.last_log_time > 0.75:
             self.last_log_time = now
             gx, gy, gz = preview.grasp_xyz
+            shape_msg = "shape=none"
+            if preview.pointcloud_shape is not None:
+                shape = preview.pointcloud_shape
+                shape_msg = (
+                    f"shape=pc points={shape.point_count} conf={shape.axis_confidence:.2f} "
+                    f"visual_conf={shape.visual_axis_confidence:.2f} "
+                    f"extent=({shape.extent_major_m:.3f},{shape.extent_minor_m:.3f},{shape.extent_z_m:.3f}) "
+                    f"z_bias={shape.z_bias_m:.3f}"
+                )
             self.get_logger().info(
                 f"{preview.detection.label} conf={preview.detection.confidence:.2f} "
                 f"depth={preview.depth_m:.3f}m grasp_camera=({gx:.3f},{gy:.3f},{gz:.3f}) "
                 f"base_offset=({self.grasp_base_offset[0]:.3f},{self.grasp_base_offset[1]:.3f},{self.grasp_base_offset[2]:.3f}) "
-                f"roi_points={len(preview.roi_points)} snapshot={preview.snapshot_reason} "
+                f"roi={preview.roi_source} roi_points={len(preview.roi_points)} snapshot={preview.snapshot_reason} "
+                f"{shape_msg} "
                 f"planned_path_points={len(preview.base_path_xyz)} "
                 f"stream_rate={max(float(self.args.playback_rate), 1.0):.1f}Hz "
                 f"trajectory={preview.ik_message} "
@@ -1813,12 +2478,8 @@ class GraspPreviewNode(Node):
 
         if progress < close_start:
             amount = 0.0
-        elif progress < close_end:
-            amount = self._smoothstep((progress - close_start) / max(close_end - close_start, 1e-6))
         elif progress < open_start:
             amount = 1.0
-        elif progress < open_end:
-            amount = 1.0 - self._smoothstep((progress - open_start) / max(open_end - open_start, 1e-6))
         else:
             amount = 0.0
 
@@ -2038,9 +2699,275 @@ class GraspPreviewNode(Node):
     def _make_constrained_arm_trajectory(
         self, preview: GraspPreview
     ) -> tuple[list[JointTrajectoryFrame], str]:
+        if str(self.args.planner_backend) == "none":
+            return [], "perception_only: planning skipped"
+        if str(self.args.planner_backend) == "remote":
+            return self._make_remote_arm_trajectory(preview)
         if str(self.args.planner_backend) == "moveit":
             return self._make_moveit_arm_trajectory(preview)
         return self._make_local_arm_trajectory(preview)
+
+    def _make_remote_arm_trajectory(
+        self, preview: GraspPreview
+    ) -> tuple[list[JointTrajectoryFrame], str]:
+        targets = self._planning_target_samples(preview)
+        if not targets:
+            return [], "remote: no planning key waypoints"
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.aubo_base_frame,
+                self.base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.05),
+            )
+        except TransformException as exc:
+            return [], f"remote: waiting for TF {self.aubo_base_frame} <- {self.base_frame}: {exc}"
+        aubo_from_base = self._matrix_from_transform(transform)
+
+        q_current = np.asarray(self.current_arm_joints, dtype=float)
+        moveit_targets: list[dict[str, object]] = []
+        reached_targets: list[str] = []
+        notes: list[str] = []
+        current_rotation_base = self._current_end_effector_rotation_base()
+
+        for index, (target_name, target_base, progress) in enumerate(targets):
+            position_tolerance, orientation_tolerance, use_orientation_constraint = (
+                self._remote_moveit_goal_options(target_name)
+            )
+            target_rotations_base = self._target_orientation_candidates_base(
+                target_base,
+                progress,
+                current_rotation_base,
+                preview.pointcloud_shape,
+                target_name,
+            )
+            alternatives: list[dict[str, object]] = []
+            failure_messages: list[str] = []
+            for orientation_index, target_rotation_base in enumerate(target_rotations_base):
+                tool_target = self._tool0_target_from_grasp_target(
+                    target_base, target_rotation_base
+                )
+                if tool_target is None:
+                    _matrix, message = self._tool_to_grasp_matrix()
+                    return [], f"remote: {message}"
+                target_tool0_base, target_tool0_rotation_base = tool_target
+                tool_ground_ok, tool_ground_clearance, tool_ground_hit = (
+                    self._tool_target_ground_clearance_base(target_tool0_base, target_base)
+                )
+                if not tool_ground_ok:
+                    failure_messages.append(
+                        f"ori{orientation_index}: {tool_ground_hit} clearance={tool_ground_clearance:.3f}m"
+                    )
+                    continue
+                unreachable_note = self._moveit_unreachable_note(target_tool0_base)
+                if unreachable_note:
+                    failure_messages.append(f"ori{orientation_index}: {unreachable_note}")
+                    continue
+                tool0_aubo = self._transform_matrix_point(
+                    aubo_from_base, np.asarray(target_tool0_base, dtype=float)
+                )
+                tool0_rotation_aubo = np.asarray(aubo_from_base[:3, :3], dtype=float) @ np.asarray(
+                    self._orthonormalize_rotation(target_tool0_rotation_base), dtype=float
+                )
+                tool0_quat_aubo = self._quat_msg_from_matrix(tool0_rotation_aubo)
+                alternatives.append(
+                    {
+                        "name": f"{target_name}:ori{orientation_index}",
+                        "orientation_index": int(orientation_index),
+                        "tool0_xyz_aubo": [float(v) for v in tool0_aubo],
+                        "tool0_quat_aubo": [
+                            float(tool0_quat_aubo.x),
+                            float(tool0_quat_aubo.y),
+                            float(tool0_quat_aubo.z),
+                            float(tool0_quat_aubo.w),
+                        ],
+                    }
+                )
+                if not use_orientation_constraint:
+                    max_alternatives = 1
+                else:
+                    max_alternatives = 6 if target_name == "grasp" else 3
+                if len(alternatives) >= max_alternatives:
+                    break
+            if not alternatives:
+                x, y, z = target_base
+                return (
+                    [],
+                    f"remote: no geometric pose candidate at {target_name} {index + 1}/{len(targets)} "
+                    f"grasp_xyz=({x:.3f},{y:.3f},{z:.3f}); "
+                    + " | ".join(failure_messages[-6:]),
+                )
+            reached_targets.append(target_name)
+            orientation_note = "pose" if use_orientation_constraint else "position_only"
+            notes.append(
+                f"{target_name}:remote_{orientation_note}_alternatives={len(alternatives)}"
+                f":pos_tol={position_tolerance:.3f}:ori_tol={orientation_tolerance:.3f}"
+            )
+            current_rotation_base = np.asarray(target_rotations_base[0], dtype=float)
+            first = alternatives[0]
+            moveit_targets.append(
+                {
+                    "name": target_name,
+                    "tool0_xyz_aubo": first["tool0_xyz_aubo"],
+                    "tool0_quat_aubo": first["tool0_quat_aubo"],
+                    "position_tolerance": position_tolerance,
+                    "orientation_tolerance": orientation_tolerance,
+                    "use_orientation_constraint": use_orientation_constraint,
+                    "alternatives": alternatives,
+                }
+            )
+
+        payload = {
+            "request_id": f"grasp_preview_{int(time.time() * 1000)}",
+            "current_joints_rad": [float(v) for v in q_current],
+            "targets": [
+                {
+                    "name": name,
+                    "xyz_base": [float(v) for v in target_base],
+                    "phase": name,
+                }
+                for name, target_base, _progress in targets
+            ],
+            "candidates": [
+                {
+                    "label": "remote_moveit_pose_goals",
+                    "score": 0.0,
+                    "waypoints_rad": [],
+                    "events": [],
+                }
+            ],
+            "moveit_targets": moveit_targets,
+            "moveit": {
+                "planner_id": str(self.args.moveit_planners).split(",")[0].strip()
+                or "RRTConnectkConfigDefault",
+                "planning_time": float(self.args.moveit_planning_time),
+                "planning_attempts": int(self.args.moveit_planning_attempts),
+                "velocity_scale": float(self.args.moveit_velocity_scale),
+                "accel_scale": float(self.args.moveit_accel_scale),
+                "service_timeout_padding": float(self.args.moveit_service_timeout_padding),
+            },
+            "constraints": {
+                "ground_min_z_base": float(self.args.ground_min_z_base),
+                "tool_ground_clearance": float(self.args.tool_ground_clearance),
+                "max_joint_speed_rad_s": float(self.args.preview_max_joint_speed),
+                "max_joint_accel_rad_s2": float(self.args.preview_max_joint_accel),
+                "max_segment_joint_delta_rad": float(self.args.real_sdk_max_segment_joint_delta),
+                "min_segment_duration_sec": float(self.args.real_sdk_min_segment_duration),
+            },
+        }
+        try:
+            response = self._remote_planner_post(payload)
+            frames = self._remote_trajectory_frames(response)
+        except Exception as exc:
+            return [], f"remote: planner request failed: {exc}"
+        if not frames:
+            return [], f"remote: empty trajectory response status={response.get('status')}"
+        return (
+            frames,
+            "remote_joint_waypoint_plan "
+            f"url={self._redacted_remote_url()} "
+            f"targets={','.join(reached_targets)} "
+            f"frames={len(frames)} duration={frames[-1].time_from_start:.2f}s "
+            f"ik={';'.join(notes)} status={response.get('status')}",
+        )
+
+    def _remote_moveit_goal_options(self, target_name: str) -> tuple[float, float, bool]:
+        name = str(target_name).strip()
+        if name == "grasp":
+            return (
+                max(float(self.args.moveit_position_tolerance), 0.002),
+                max(float(self.args.moveit_ik_orientation_tolerance), 0.01),
+                True,
+            )
+        if name == "approach":
+            return (
+                max(float(self.args.moveit_soft_waypoint_position_tolerance), 0.0),
+                max(float(self.args.moveit_soft_waypoint_orientation_tolerance), 0.01),
+                True,
+            )
+        if name in {"safe_mid", "lift", "basket_over", "drop"}:
+            return (
+                max(float(self.args.moveit_soft_waypoint_position_tolerance), 0.0),
+                max(float(self.args.moveit_release_orientation_tolerance), 0.01),
+                False,
+            )
+        return (
+            max(float(self.args.moveit_local_fallback_position_tolerance), 0.0),
+            max(float(self.args.moveit_local_fallback_orientation_tolerance), 0.01),
+            True,
+        )
+
+    def _remote_planner_post(self, payload: dict[str, object]) -> dict[str, object]:
+        url = str(self.args.remote_planner_url).rstrip("/") + "/plan"
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        timeout = max(float(self.args.remote_planner_timeout), 0.1)
+        target_count = len(payload.get("moveit_targets", [])) if isinstance(payload.get("moveit_targets"), list) else 0
+        start = time.monotonic()
+        self.get_logger().info(
+            f"remote planner request: url={self._redacted_remote_url()} "
+            f"moveit_targets={target_count} timeout={timeout:.1f}s"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as handle:
+                response = json.loads(handle.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise RuntimeError(str(exc)) from exc
+        elapsed = time.monotonic() - start
+        self.get_logger().info(
+            f"remote planner response: ok={bool(response.get('ok')) if isinstance(response, dict) else False} "
+            f"wall={elapsed:.2f}s"
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("non-object JSON response")
+        if not bool(response.get("ok")):
+            raise RuntimeError(
+                f"{response.get('status')}: {response.get('constraint_issues') or response.get('message')}"
+            )
+        return response
+
+    def _remote_trajectory_frames(self, response: dict[str, object]) -> list[JointTrajectoryFrame]:
+        trajectory = response.get("trajectory")
+        if not isinstance(trajectory, dict):
+            return []
+        frames_raw = trajectory.get("frames")
+        if not isinstance(frames_raw, list):
+            return []
+        frames: list[JointTrajectoryFrame] = []
+        for index, raw in enumerate(frames_raw):
+            if not isinstance(raw, dict):
+                continue
+            positions = tuple(float(v) for v in raw.get("positions", []))
+            if len(positions) != 6:
+                continue
+            velocities = tuple(float(v) for v in raw.get("velocities", [0.0] * 6))
+            accelerations = tuple(float(v) for v in raw.get("accelerations", [0.0] * 6))
+            if len(velocities) != 6:
+                velocities = (0.0,) * 6
+            if len(accelerations) != 6:
+                accelerations = (0.0,) * 6
+            frames.append(
+                JointTrajectoryFrame(
+                    float(raw.get("time_from_start", index * 0.2)),
+                    positions,  # type: ignore[arg-type]
+                    velocities,  # type: ignore[arg-type]
+                    accelerations,  # type: ignore[arg-type]
+                )
+            )
+        return frames
+
+    def _redacted_remote_url(self) -> str:
+        url = str(self.args.remote_planner_url)
+        if "@" not in url:
+            return url
+        scheme, rest = url.split("://", 1) if "://" in url else ("", url)
+        host = rest.split("@", 1)[1]
+        return f"{scheme + '://' if scheme else ''}<redacted>@{host}"
 
     def _make_moveit_arm_trajectory(
         self, preview: GraspPreview
@@ -2077,20 +3004,26 @@ class GraspPreviewNode(Node):
         total_points = 0
         soft_waypoints = 0
         local_fallbacks = 0
+        local_firsts = 0
         fallback_notes: list[str] = []
         current_rotation_base = self._current_end_effector_rotation_base()
         current_tool0_rotation_base = self._current_tool_rotation_base()
         base_from_aubo = self._invert_rigid(aubo_from_base)
 
         for index, (target_name, target_base, progress) in enumerate(targets):
-            is_soft_waypoint = target_name not in {"grasp", "drop"}
+            is_soft_waypoint = target_name != "grasp"
             target_rotations_base = self._target_orientation_candidates_base(
-                target_base, progress, current_rotation_base
+                target_base,
+                progress,
+                current_rotation_base,
+                preview.pointcloud_shape,
+                target_name,
             )
             response = None
             response_planner = ""
             failure_messages: list[str] = []
             fallback_candidate = None
+            local_first_accepted = False
             for planner_id in planner_ids:
                 for orientation_index, target_rotation_base in enumerate(target_rotations_base):
                     tool_target = self._tool0_target_from_grasp_target(
@@ -2100,6 +3033,16 @@ class GraspPreviewNode(Node):
                         _matrix, message = self._tool_to_grasp_matrix()
                         return [], f"moveit: {message}"
                     target_tool0_base, target_tool0_rotation_base = tool_target
+                    tool_ground_ok, tool_ground_clearance, tool_ground_hit = (
+                        self._tool_target_ground_clearance_base(target_tool0_base, target_base)
+                    )
+                    if not tool_ground_ok:
+                        tx, ty, tz = target_tool0_base
+                        failure_messages.append(
+                            f"ori{orientation_index}/{target_name}: tool0=({tx:.3f},{ty:.3f},{tz:.3f}) "
+                            f"{tool_ground_hit} clearance={tool_ground_clearance:.3f}m"
+                        )
+                        continue
                     unreachable_note = self._moveit_unreachable_note(target_tool0_base)
                     if unreachable_note:
                         x, y, z = target_base
@@ -2127,9 +3070,17 @@ class GraspPreviewNode(Node):
                     q_unwrapped_goal = np.asarray(q_current, dtype=float) + self._joint_delta(
                         q_goal, q_current
                     )
-                    collision_free, clearance, hit_name = self._arm_collision_clearance_base(
+                    endpoint_safe, endpoint_clearance, endpoint_hit_name = self._arm_collision_clearance_base(
                         q_unwrapped_goal, base_from_aubo
                     )
+                    segment_safe, segment_clearance, segment_hit_name = (
+                        self._joint_segment_collision_clearance_base(
+                            q_current, q_unwrapped_goal, base_from_aubo
+                        )
+                    )
+                    collision_free = bool(endpoint_safe and segment_safe)
+                    clearance = min(float(endpoint_clearance), float(segment_clearance))
+                    hit_name = endpoint_hit_name if not endpoint_safe else segment_hit_name
                     (
                         fallback_position_tolerance,
                         fallback_orientation_tolerance,
@@ -2154,23 +3105,76 @@ class GraspPreviewNode(Node):
                             collision_free,
                             hit_name,
                             orientation_index,
+                            target_rotation_base,
+                            target_tool0_rotation_base,
                         )
                         if fallback_candidate is None or fallback_score < fallback_candidate[0]:
                             fallback_candidate = candidate
-                    if not ik_ok:
-                        tx, ty, tz = target_tool0_base
-                        failure_messages.append(
-                            f"ik/ori{orientation_index} tool0=({tx:.3f},{ty:.3f},{tz:.3f}) "
-                            f"pos_err={position_error:.3f}m ori_err={orientation_error:.3f}rad"
-                        )
-                        continue
-                    attempt = self._call_moveit_plan(
-                        q_current,
-                        q_goal,
-                        current_tool0_rotation_base,
-                        planner_id,
+                    local_first_ok = (
+                        bool(self.args.moveit_local_first)
+                        and position_error
+                        <= max(float(self.args.moveit_position_tolerance) * 2.0, 0.01)
+                        and orientation_error
+                        <= max(float(self.args.moveit_ik_orientation_tolerance), 0.01)
+                        and collision_free
                     )
+                    if local_first_ok:
+                        if np.max(np.abs(q_unwrapped_goal - q_waypoints[-1])) > 1e-5:
+                            q_waypoints.append(np.asarray(q_unwrapped_goal, dtype=float))
+                        q_current = np.asarray(q_waypoints[-1], dtype=float)
+                        reached_targets.append(target_name)
+                        planner_used.append(f"local_first_ori{orientation_index}")
+                        local_firsts += 1
+                        fallback_notes.append(
+                            f"{target_name}/ori{orientation_index}:"
+                            f"pos_err={position_error:.3f}m,"
+                            f"ori_err={orientation_error:.3f}rad"
+                        )
+                        current_rotation_base = self._orthonormalize_rotation(
+                            np.asarray(target_rotation_base, dtype=float)
+                        )
+                        current_tool0_rotation_base = self._orthonormalize_rotation(
+                            np.asarray(target_tool0_rotation_base, dtype=float)
+                        )
+                        self._throttled_log(
+                            f"MoveIt local-first accepted at {target_name}; "
+                            f"pos_err={position_error:.3f}m ori_err={orientation_error:.3f}rad "
+                            f"clearance={clearance:.3f}m"
+                        )
+                        local_first_accepted = True
+                        break
+                    if not ik_ok:
+                        if not bool(self.args.moveit_pose_goal_on_ik_failure):
+                            tx, ty, tz = target_tool0_base
+                            failure_messages.append(
+                                f"ik/ori{orientation_index} tool0=({tx:.3f},{ty:.3f},{tz:.3f}) "
+                                f"pos_err={position_error:.3f}m ori_err={orientation_error:.3f}rad"
+                            )
+                            continue
+                        attempt = self._call_moveit_pose_plan(
+                            q_current,
+                            target_tool0_base,
+                            target_tool0_rotation_base,
+                            planner_id,
+                            max(float(self.args.moveit_ik_orientation_tolerance), 0.01),
+                            current_tool0_rotation_base,
+                        )
+                    else:
+                        attempt = self._call_moveit_plan(
+                            q_current,
+                            q_goal,
+                            current_tool0_rotation_base,
+                            planner_id,
+                        )
                     if attempt.response is not None:
+                        path_safe, path_message = self._moveit_response_ground_safe(
+                            attempt.response, q_current, base_from_aubo
+                        )
+                        if not path_safe:
+                            failure_messages.append(
+                                f"{planner_id}/ori{orientation_index}: {path_message}"
+                            )
+                            continue
                         response = attempt.response
                         response_planner = planner_id
                         break
@@ -2181,8 +3185,12 @@ class GraspPreviewNode(Node):
                         f"q_goal_pos_err={position_error:.3f}m q_goal_ori_err={orientation_error:.3f}rad: "
                         f"{attempt.message}"
                     )
+                if local_first_accepted:
+                    break
                 if response is not None:
                     break
+            if local_first_accepted:
+                continue
             if response is None:
                 x, y, z = target_base
                 failure_text = (
@@ -2199,6 +3207,8 @@ class GraspPreviewNode(Node):
                         collision_free,
                         hit_name,
                         orientation_index,
+                        fallback_rotation_base,
+                        fallback_tool0_rotation_base,
                     ) = fallback_candidate
                     if not collision_free and not bool(self.args.allow_colliding_best_effort):
                         failure_text += f"; local fallback collision at {hit_name or 'vehicle'}"
@@ -2214,6 +3224,12 @@ class GraspPreviewNode(Node):
                             f"pos_err={position_error:.3f}m,"
                             f"ori_err={orientation_error:.3f}rad"
                         )
+                        current_rotation_base = self._orthonormalize_rotation(
+                            np.asarray(fallback_rotation_base, dtype=float)
+                        )
+                        current_tool0_rotation_base = self._orthonormalize_rotation(
+                            np.asarray(fallback_tool0_rotation_base, dtype=float)
+                        )
                         self._throttled_log(
                             f"MoveIt blocked at {target_name}; using local fallback "
                             f"pos_err={position_error:.3f}m ori_err={orientation_error:.3f}rad"
@@ -2228,7 +3244,7 @@ class GraspPreviewNode(Node):
                         f"blocked_at={target_name} "
                         f"planners={'+'.join(planner_used)} raw_points={total_points} "
                         f"targets={','.join(reached_targets)} soft_waypoints={soft_waypoints} "
-                        f"local_fallbacks={local_fallbacks} "
+                        f"local_firsts={local_firsts} local_fallbacks={local_fallbacks} "
                         f"fallbacks={';'.join(fallback_notes) if fallback_notes else 'none'} "
                         f"{limit_message}; {failure_text}",
                     )
@@ -2252,6 +3268,12 @@ class GraspPreviewNode(Node):
                 if np.max(np.abs(q_unwrapped - q_waypoints[-1])) > 1e-5:
                     q_waypoints.append(q_unwrapped)
             q_current = np.asarray(q_waypoints[-1], dtype=float)
+            current_rotation_base = self._orthonormalize_rotation(
+                np.asarray(target_rotation_base, dtype=float)
+            )
+            current_tool0_rotation_base = self._orthonormalize_rotation(
+                np.asarray(target_tool0_rotation_base, dtype=float)
+            )
             planner_used.append(response_planner)
             reached_targets.append(target_name)
             total_points += len(joint_trajectory.points)
@@ -2266,9 +3288,90 @@ class GraspPreviewNode(Node):
             "moveit_ompl_joint_goal "
             f"planners={'+'.join(planner_used)} raw_points={total_points} "
             f"targets={','.join(reached_targets)} "
-            f"soft_waypoints={soft_waypoints} local_fallbacks={local_fallbacks} "
+            f"soft_waypoints={soft_waypoints} local_firsts={local_firsts} "
+            f"local_fallbacks={local_fallbacks} "
             f"fallbacks={';'.join(fallback_notes) if fallback_notes else 'none'} "
             f"{limit_message}",
+        )
+
+    def _tool_target_ground_clearance_base(
+        self,
+        tool0_base: tuple[float, float, float],
+        grasp_base: tuple[float, float, float],
+    ) -> tuple[bool, float, str | None]:
+        threshold = float(self.args.ground_min_z_base) + max(
+            float(self.args.tool_ground_clearance), 0.0
+        )
+        min_clearance = float("inf")
+        hit_name: str | None = None
+        a = np.asarray(tool0_base, dtype=float)
+        b = np.asarray(grasp_base, dtype=float)
+        samples = max(int(self.args.arm_collision_samples_per_link), 2)
+        for t in np.linspace(0.0, 1.0, samples):
+            point = a * (1.0 - t) + b * t
+            clearance = float(point[2] - threshold)
+            if clearance < min_clearance:
+                min_clearance = clearance
+                hit_name = "ground/gripper_tcp"
+            if clearance < 0.0:
+                return False, clearance, hit_name
+        return True, float(min_clearance if np.isfinite(min_clearance) else 0.0), hit_name
+
+    def _moveit_response_ground_safe(
+        self,
+        response,
+        q_start: np.ndarray,
+        base_from_aubo: np.ndarray,
+    ) -> tuple[bool, str]:
+        trajectory = response.trajectory.joint_trajectory
+        if not trajectory.points:
+            return False, "empty trajectory"
+        name_to_index = {name: i for i, name in enumerate(trajectory.joint_names)}
+        if not all(name in name_to_index for name in ARM_JOINT_NAMES):
+            return False, "trajectory missing Aubo joints"
+        q_previous = np.asarray(q_start, dtype=float)
+        for point_index, point in enumerate(trajectory.points[1:], start=1):
+            q_raw = np.asarray(
+                [point.positions[name_to_index[name]] for name in ARM_JOINT_NAMES],
+                dtype=float,
+            )
+            q_unwrapped = q_previous + self._joint_delta(q_raw, q_previous)
+            safe, clearance, hit_name = self._arm_collision_clearance_base(
+                q_unwrapped, base_from_aubo
+            )
+            if not safe:
+                return (
+                    False,
+                    f"path collision at point {point_index}: {hit_name or 'vehicle'} "
+                    f"clearance={clearance:.3f}m",
+                )
+            q_previous = q_unwrapped
+        return True, "ok"
+
+    def _joint_segment_collision_clearance_base(
+        self,
+        q_start: np.ndarray,
+        q_goal: np.ndarray,
+        base_from_aubo: np.ndarray,
+    ) -> tuple[bool, float, str | None]:
+        delta = self._joint_delta(np.asarray(q_goal, dtype=float), np.asarray(q_start, dtype=float))
+        samples = max(int(self.args.arm_collision_samples_per_link), 3)
+        min_clearance = float("inf")
+        min_hit_name: str | None = None
+        for alpha in np.linspace(0.0, 1.0, samples):
+            q_sample = np.asarray(q_start, dtype=float) + float(alpha) * delta
+            safe, clearance, hit_name = self._arm_collision_clearance_base(
+                q_sample, base_from_aubo
+            )
+            if clearance < min_clearance:
+                min_clearance = float(clearance)
+                min_hit_name = hit_name
+            if not safe:
+                return False, float(clearance), hit_name
+        return (
+            True,
+            float(min_clearance if np.isfinite(min_clearance) else 0.0),
+            min_hit_name,
         )
 
     def _moveit_fallback_tolerances(
@@ -2346,6 +3449,72 @@ class GraspPreviewNode(Node):
         )
         q_goal = np.asarray(q_start, dtype=float) + self._joint_delta(q_solution, q_start)
         return bool(ok), q_goal, float(position_error), float(orientation_error)
+
+    def _call_moveit_pose_plan(
+        self,
+        q_start: np.ndarray,
+        target_tool0_base: tuple[float, float, float],
+        target_tool0_rotation_base: np.ndarray,
+        planner_id: str,
+        orientation_tolerance: float,
+        reference_rotation_base: np.ndarray,
+    ) -> MoveItPlanAttempt:
+        request = GetMotionPlan.Request()
+        motion_request = request.motion_plan_request
+        motion_request.group_name = "aubo_arm"
+        motion_request.pipeline_id = "ompl"
+        motion_request.planner_id = planner_id
+        motion_request.num_planning_attempts = max(int(self.args.moveit_planning_attempts), 1)
+        motion_request.allowed_planning_time = max(float(self.args.moveit_planning_time), 0.2)
+        motion_request.max_velocity_scaling_factor = min(
+            max(float(self.args.moveit_velocity_scale), 0.01), 1.0
+        )
+        motion_request.max_acceleration_scaling_factor = min(
+            max(float(self.args.moveit_accel_scale), 0.01), 1.0
+        )
+        start_names, start_positions = self._moveit_start_state_joint_values(q_start)
+        motion_request.start_state.joint_state.name = start_names
+        motion_request.start_state.joint_state.position = start_positions
+        motion_request.start_state.is_diff = False
+        motion_request.workspace_parameters.header.frame_id = self.base_frame
+        motion_request.workspace_parameters.min_corner.x = -1.0
+        motion_request.workspace_parameters.min_corner.y = -1.0
+        motion_request.workspace_parameters.min_corner.z = -0.3
+        motion_request.workspace_parameters.max_corner.x = 1.6
+        motion_request.workspace_parameters.max_corner.y = 1.0
+        motion_request.workspace_parameters.max_corner.z = 1.2
+        motion_request.goal_constraints = [
+            self._moveit_pose_goal_constraint(
+                target_tool0_base,
+                target_tool0_rotation_base,
+                orientation_tolerance,
+            )
+        ]
+        if bool(self.args.moveit_use_orientation_path_constraint):
+            motion_request.path_constraints = self._moveit_orientation_path_constraint(
+                reference_rotation_base
+            )
+
+        future = self.moveit_plan_client.call_async(request)
+        deadline = time.monotonic() + max(
+            float(self.args.moveit_planning_time)
+            + max(float(self.args.moveit_service_timeout_padding), 0.0),
+            0.3,
+        )
+        while not future.done() and time.monotonic() < deadline and rclpy.ok():
+            time.sleep(0.02)
+        if not future.done():
+            return MoveItPlanAttempt(None, "pose goal service timeout")
+        result = future.result()
+        if result is None:
+            return MoveItPlanAttempt(None, "pose goal empty service result")
+        response = result.motion_plan_response
+        if int(response.error_code.val) != 1:
+            return MoveItPlanAttempt(
+                None,
+                f"pose goal {self._moveit_error_message(int(response.error_code.val))}",
+            )
+        return MoveItPlanAttempt(response, "pose goal success")
 
     def _moveit_joint_goal_constraint(self, q_goal: np.ndarray) -> Constraints:
         constraints = Constraints()
@@ -2561,10 +3730,16 @@ class GraspPreviewNode(Node):
         max_position_error = 0.0
         max_orientation_error = 0.0
         orientation_candidates = 0
-        for _target_name, point, progress in targets:
+        for target_name, point, progress in targets:
             best_candidate = None
             for candidate_index, target_rotation_base in enumerate(
-                self._target_orientation_candidates_base(point, progress, current_rotation_base)
+                self._target_orientation_candidates_base(
+                    point,
+                    progress,
+                    current_rotation_base,
+                    preview.pointcloud_shape,
+                    target_name,
+                )
             ):
                 orientation_candidates += 1
                 tool_target = self._tool0_target_from_grasp_target(point, target_rotation_base)
@@ -2589,9 +3764,17 @@ class GraspPreviewNode(Node):
                     orientation_weight=PREVIEW_IK_ORIENTATION_WEIGHT,
                 )
                 q_unwrapped = q_waypoints[-1] + self._joint_delta(q_solution, q_waypoints[-1])
-                collision_free, clearance, hit_name = self._arm_collision_clearance_base(
+                endpoint_safe, endpoint_clearance, endpoint_hit_name = self._arm_collision_clearance_base(
                     q_unwrapped, base_from_aubo
                 )
+                segment_safe, segment_clearance, segment_hit_name = (
+                    self._joint_segment_collision_clearance_base(
+                        q_waypoints[-1], q_unwrapped, base_from_aubo
+                    )
+                )
+                collision_free = bool(endpoint_safe and segment_safe)
+                clearance = min(float(endpoint_clearance), float(segment_clearance))
+                hit_name = endpoint_hit_name if not endpoint_safe else segment_hit_name
                 joint_step = float(np.linalg.norm(q_unwrapped - q_waypoints[-1]))
                 collision_score = 0.0 if collision_free else COLLISION_PENALTY
                 score = (
@@ -2611,6 +3794,7 @@ class GraspPreviewNode(Node):
                     float(position_error),
                     float(orientation_error),
                     hit_name,
+                    target_rotation_base,
                 )
                 if best_candidate is None or score < best_candidate[0]:
                     best_candidate = candidate
@@ -2628,6 +3812,7 @@ class GraspPreviewNode(Node):
                 position_error,
                 orientation_error,
                 hit_name,
+                target_rotation_base,
             ) = best_candidate
             if not collision_free:
                 collision_failures += 1
@@ -2635,11 +3820,25 @@ class GraspPreviewNode(Node):
                     return [], f"collision blocked at {hit_name or 'vehicle'} progress={progress:.2f}"
             if not ok:
                 failures += 1
+            if bool(self.args.local_strict_ik):
+                position_limit = max(float(self.args.local_position_tolerance), 0.001)
+                orientation_limit = max(float(self.args.local_orientation_tolerance), 0.01)
+                if (not ok) or position_error > position_limit or orientation_error > orientation_limit:
+                    x, y, z = point
+                    return (
+                        [],
+                        f"local ik rejected at {target_name} xyz=({x:.3f},{y:.3f},{z:.3f}) "
+                        f"pos_err={position_error:.3f}m/{position_limit:.3f}m "
+                        f"ori_err={orientation_error:.3f}rad/{orientation_limit:.3f}rad",
+                    )
             max_position_error = max(max_position_error, float(position_error))
             max_orientation_error = max(max_orientation_error, float(orientation_error))
             if np.max(np.abs(q_unwrapped - q_waypoints[-1])) > 1e-5:
                 q_waypoints.append(q_unwrapped)
             q_seed = np.asarray(q_solution, dtype=float)
+            current_rotation_base = self._orthonormalize_rotation(
+                np.asarray(target_rotation_base, dtype=float)
+            )
 
         frames, limit_message = self._generate_limited_joint_frames(q_waypoints)
         status = "ok" if failures == 0 else f"best-effort ik_failures={failures}"
@@ -2669,6 +3868,8 @@ class GraspPreviewNode(Node):
         point_base: tuple[float, float, float],
         progress: float,
         current_rotation_base: np.ndarray,
+        pointcloud_shape: PointCloudGraspShape | None = None,
+        target_name: str = "",
     ) -> list[np.ndarray]:
         release_tilt = math.radians(float(self.args.release_tool_tilt_deg))
         tilted_down = np.asarray(
@@ -2685,26 +3886,169 @@ class GraspPreviewNode(Node):
         grasp_down = self._rotation_from_tool_z_base(
             np.asarray([0.0, 0.0, -1.0], dtype=float), grasp_hint
         )
+        shape_hints = self._pointcloud_shape_orientation_hints(pointcloud_shape)
 
-        blend = min(max((float(progress) - 0.18) / 0.42, 0.0), 1.0)
-        if progress < 0.18:
+        phase = self._target_orientation_phase(target_name, progress)
+        if bool(self.args.lock_grasp_orientation) and phase in {"grasp", "carry", "release"}:
+            return [self._orthonormalize_rotation(np.asarray(current_rotation_base, dtype=float))]
+        if phase == "current":
             nominal = current_rotation_base
-        elif progress < 0.60:
-            nominal = self._blend_rotation(current_rotation_base, grasp_down, blend)
+        elif phase == "grasp":
+            nominal = grasp_down
+        elif phase == "carry":
+            nominal = current_rotation_base
         else:
             nominal = downward
 
         limit_rad = self._tool_orientation_limit_rad()
-        yaw_offsets = (0.0,)
-        candidates: list[np.ndarray] = []
-        for yaw in yaw_offsets:
-            candidate = nominal @ self._rpy_matrix(0.0, 0.0, yaw)
-            candidate = self._limit_rotation_from_reference(
-                current_rotation_base, candidate, limit_rad
+        if phase in {"current", "carry"}:
+            yaw_offsets = (0.0,)
+            tilt_offsets = ((0.0, 0.0),)
+        elif phase == "grasp":
+            yaw_offsets = self._angle_offsets_rad(
+                str(self.args.grasp_orientation_yaw_offsets_deg),
+                "--grasp-orientation-yaw-offsets-deg",
             )
-            if not any(self._rotation_distance(candidate, existing) < 1e-4 for existing in candidates):
-                candidates.append(candidate)
+            tilt_offsets = self._grasp_tilt_offsets_rad()
+        else:
+            yaw_offsets = self._angle_offsets_rad(
+                str(self.args.transit_orientation_yaw_offsets_deg),
+                "--transit-orientation-yaw-offsets-deg",
+            )
+            tilt_offsets = ((0.0, 0.0),)
+        candidates: list[np.ndarray] = []
+        if phase == "grasp":
+            for hint in shape_hints:
+                shape_nominal = self._rotation_from_tool_z_base(
+                    np.asarray([0.0, 0.0, -1.0], dtype=float), hint
+                )
+                for yaw in (0.0,):
+                    for roll, pitch in tilt_offsets[:3]:
+                        candidate = self._orthonormalize_rotation(
+                            shape_nominal @ self._rpy_matrix(roll, pitch, yaw)
+                        )
+                        candidate = self._limit_rotation_from_reference(
+                            current_rotation_base, candidate, limit_rad
+                        )
+                        if not self._is_topdown_grasp_orientation(candidate):
+                            continue
+                        if not any(
+                            self._rotation_distance(candidate, existing) < 1e-4
+                            for existing in candidates
+                        ):
+                            candidates.append(candidate)
+                            if len(candidates) >= self._max_grasp_orientation_candidates():
+                                return candidates
+        for yaw in yaw_offsets:
+            for roll, pitch in tilt_offsets:
+                candidate = nominal @ self._rpy_matrix(roll, pitch, yaw)
+                if phase in {"current", "grasp", "carry", "release"}:
+                    candidate = self._limit_rotation_from_reference(
+                        current_rotation_base, candidate, limit_rad
+                    )
+                else:
+                    candidate = self._orthonormalize_rotation(candidate)
+                if phase in {"grasp", "carry", "release"} and not self._is_topdown_grasp_orientation(
+                    candidate
+                ):
+                    continue
+                if not any(
+                    self._rotation_distance(candidate, existing) < 1e-4
+                    for existing in candidates
+                ):
+                    candidates.append(candidate)
+                    if (
+                        phase == "grasp"
+                        and len(candidates) >= self._max_grasp_orientation_candidates()
+                    ):
+                        return candidates
+        if not candidates and phase in {"grasp", "carry", "release"}:
+            candidates.append(self._orthonormalize_rotation(np.asarray(current_rotation_base, dtype=float)))
         return candidates
+
+    def _target_orientation_phase(self, target_name: str, progress: float) -> str:
+        name = str(target_name).strip()
+        if name in {"start_ee", "observe_start"}:
+            return "current"
+        if name in {"approach", "grasp"}:
+            return "grasp"
+        if name in {"safe_mid", "lift"}:
+            return "carry"
+        if name in {"basket_over", "drop"}:
+            return "release"
+        if progress < 0.18:
+            return "current"
+        if progress < 0.60:
+            return "grasp"
+        return "release"
+
+    def _max_grasp_orientation_candidates(self) -> int:
+        return max(int(self.args.max_grasp_orientation_candidates), 1)
+
+    def _pointcloud_shape_orientation_hints(
+        self, pointcloud_shape: PointCloudGraspShape | None
+    ) -> list[np.ndarray]:
+        if pointcloud_shape is None:
+            return []
+        axes: list[np.ndarray] = []
+        if (
+            pointcloud_shape.visual_axis_base is not None
+            and pointcloud_shape.visual_axis_confidence
+            >= max(float(self.args.visual_axis_confidence_threshold), 0.0)
+        ):
+            visual_major = np.asarray(pointcloud_shape.visual_axis_base, dtype=float)
+            visual_minor = np.asarray([-visual_major[1], visual_major[0], 0.0], dtype=float)
+            axes.extend([visual_minor, -visual_minor, visual_major, -visual_major])
+        if pointcloud_shape.axis_confidence >= max(
+            float(self.args.pointcloud_axis_confidence_threshold), 0.0
+        ):
+            axes.extend(
+                [
+                    np.asarray(pointcloud_shape.minor_axis_base, dtype=float),
+                    -np.asarray(pointcloud_shape.minor_axis_base, dtype=float),
+                    np.asarray(pointcloud_shape.major_axis_base, dtype=float),
+                    -np.asarray(pointcloud_shape.major_axis_base, dtype=float),
+                ]
+            )
+        hints: list[np.ndarray] = []
+        for axis in axes:
+            axis[2] = 0.0
+            norm = float(np.linalg.norm(axis))
+            if norm < 1e-6:
+                continue
+            axis = axis / norm
+            if not any(float(np.linalg.norm(axis - existing)) < 1e-3 for existing in hints):
+                hints.append(axis)
+        return hints
+
+    def _is_topdown_grasp_orientation(self, rotation_base: np.ndarray) -> bool:
+        tool_z_base = np.asarray(rotation_base, dtype=float)[:3, 2]
+        if float(np.linalg.norm(tool_z_base)) < 1e-9:
+            return False
+        tool_z_base = tool_z_base / float(np.linalg.norm(tool_z_base))
+        max_tilt = min(max(float(self.args.grasp_topdown_max_tilt_deg), 1.0), 89.0)
+        return float(np.dot(tool_z_base, np.asarray([0.0, 0.0, -1.0]))) >= math.cos(
+            math.radians(max_tilt)
+        )
+
+    def _angle_offsets_rad(self, value: str, label: str) -> tuple[float, ...]:
+        offsets = [math.radians(item) for item in _float_list(value, label)]
+        if not any(abs(item) < 1e-9 for item in offsets):
+            offsets.insert(0, 0.0)
+        return tuple(offsets)
+
+    def _grasp_tilt_offsets_rad(self) -> tuple[tuple[float, float], ...]:
+        values = self._angle_offsets_rad(
+            str(self.args.grasp_orientation_tilt_offsets_deg),
+            "--grasp-orientation-tilt-offsets-deg",
+        )
+        offsets: list[tuple[float, float]] = [(0.0, 0.0)]
+        for value in values:
+            if abs(value) < 1e-9:
+                continue
+            offsets.append((value, 0.0))
+            offsets.append((0.0, value))
+        return tuple(offsets)
 
     def _rotation_from_tool_z_base(self, tool_z: np.ndarray, x_hint: np.ndarray) -> np.ndarray:
         z_axis = np.asarray(tool_z, dtype=float)
@@ -2783,8 +4127,18 @@ class GraspPreviewNode(Node):
             self._transform_matrix_point(base_from_aubo, transform[:3, 3])
             for _name, transform in self.kinematics.link_transforms(np.asarray(q, dtype=float))
         ]
+        tool_to_grasp, _message = self._tool_to_grasp_matrix()
+        if tool_to_grasp is not None:
+            tool_in_aubo = self.kinematics.fk(np.asarray(q, dtype=float))
+            grasp_in_base = np.asarray(base_from_aubo, dtype=float) @ tool_in_aubo @ tool_to_grasp
+            link_points.append(tuple(float(value) for value in grasp_in_base[:3, 3]))
         samples_per_link = max(int(self.args.arm_collision_samples_per_link), 2)
         radius = max(float(self.args.arm_collision_radius), 0.0)
+        ground_threshold = (
+            float(self.args.ground_min_z_base)
+            + max(float(self.args.ground_clearance), 0.0)
+            + radius
+        )
         min_clearance = float("inf")
         hit_name: str | None = None
         for start, end in zip(link_points[1:], link_points[2:]):
@@ -2792,6 +4146,12 @@ class GraspPreviewNode(Node):
             b = np.asarray(end, dtype=float)
             for t in np.linspace(0.0, 1.0, samples_per_link):
                 point = a * (1.0 - t) + b * t
+                ground_clearance = float(point[2] - ground_threshold)
+                if ground_clearance < min_clearance:
+                    min_clearance = ground_clearance
+                    hit_name = "ground/arm"
+                if ground_clearance < 0.0:
+                    return False, ground_clearance, "ground/arm"
                 for box in self.collision_boxes:
                     clearance = self._point_box_clearance(point, box) - radius
                     if clearance < min_clearance:
@@ -2899,15 +4259,20 @@ class GraspPreviewNode(Node):
         )
 
     def _make_base_path(
-        self, camera_path: list[tuple[float, float, float]]
+        self,
+        camera_path: list[tuple[float, float, float]],
+        roi_points: list[tuple[float, float, float]] | None = None,
+        visual_axis_camera: np.ndarray | None = None,
+        visual_axis_confidence: float = 0.0,
     ) -> tuple[
         list[tuple[float, float, float]],
         list[CartesianSegment],
         list[tuple[str, tuple[float, float, float]]],
         tuple[float, float, float] | None,
+        PointCloudGraspShape | None,
     ]:
         if self.latest_depth is None:
-            return [], [], [], None
+            return [], [], [], None, None
         source_frame = self.latest_depth.header.frame_id
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -2918,29 +4283,72 @@ class GraspPreviewNode(Node):
             )
         except TransformException as exc:
             self._throttled_log(f"waiting for TF {self.base_frame} <- {source_frame}: {exc}")
-            return [], [], [], None
+            return [], [], [], None, None
 
         base_grasp_path = [
             self._apply_grasp_base_offset(self._transform_point(transform, point))
             for point in camera_path
         ]
+        pointcloud_shape = self._estimate_pointcloud_grasp_shape_base(
+            roi_points,
+            transform,
+            visual_axis_camera,
+            visual_axis_confidence,
+        )
+        if pointcloud_shape is not None and pointcloud_shape.z_bias_m > 1e-6:
+            base_grasp_path = self._apply_visible_upper_half_bias(
+                base_grasp_path, pointcloud_shape.z_bias_m
+            )
+            pointcloud_shape = replace(
+                pointcloud_shape,
+                center_base=(
+                    pointcloud_shape.center_base[0],
+                    pointcloud_shape.center_base[1],
+                    pointcloud_shape.center_base[2] - pointcloud_shape.z_bias_m,
+                ),
+            )
         start_base = self._current_grasp_origin_base()
         if start_base is None:
             start_base = self._frame_origin_in_base(END_EFFECTOR_FRAME)
         if start_base is None:
             start_base = self._transform_point(transform, (0.0, 0.0, 0.0))
         observe_base = start_base
-        pregrasp_base = base_grasp_path[0]
+        raw_pregrasp_base = base_grasp_path[0]
         grasp_base = base_grasp_path[1]
-        lift_base = base_grasp_path[2]
+        raw_lift_base = base_grasp_path[2]
+        if bool(self.args.vertical_approach):
+            min_grasp_z = (
+                float(self.args.ground_min_z_base)
+                + max(float(self.args.tool_ground_clearance), 0.0)
+                + 0.015
+            )
+            if grasp_base[2] < min_grasp_z:
+                grasp_base = (grasp_base[0], grasp_base[1], min_grasp_z)
+            approach_height = max(float(self.args.approach_distance), 0.08)
+            lift_height = max(float(self.args.lift_distance), 0.08)
+            approach_z = max(
+                grasp_base[2] + approach_height,
+                float(self.args.ground_min_z_base) + 0.18,
+            )
+            pregrasp_base = (grasp_base[0], grasp_base[1], approach_z)
+            lift_base = (
+                grasp_base[0],
+                grasp_base[1],
+                max(grasp_base[2] + lift_height, approach_z),
+            )
+        else:
+            pregrasp_base = raw_pregrasp_base
+            lift_base = raw_lift_base
+        safe_mid_lift = max(float(self.args.safe_mid_lift_height), 0.0)
         transit_z = max(
             float(self.args.transit_height),
-            lift_base[2] + 0.04,
+            grasp_base[2] + safe_mid_lift,
+            lift_base[2],
             self.basket_approach_base[2],
         )
         safe_mid_base = (
-            0.5 * (lift_base[0] + self.basket_approach_base[0]),
-            0.5 * (lift_base[1] + self.basket_approach_base[1]),
+            lift_base[0],
+            lift_base[1],
             transit_z,
         )
         waypoints = [
@@ -2983,7 +4391,161 @@ class GraspPreviewNode(Node):
         ]
         segments = self._time_parameterize_segments(raw_segments)
         path = self._sample_trajectory_for_display(segments)
-        return path, segments, waypoints, grasp_base
+        return path, segments, waypoints, grasp_base, pointcloud_shape
+
+    def _estimate_pointcloud_grasp_shape_base(
+        self,
+        roi_points: list[tuple[float, float, float]] | None,
+        transform,
+        visual_axis_camera: np.ndarray | None = None,
+        visual_axis_confidence: float = 0.0,
+    ) -> PointCloudGraspShape | None:
+        if bool(self.args.disable_pointcloud_grasp_shape):
+            return None
+        visual_axis_base = self._visual_axis_base(transform, visual_axis_camera)
+        if not roi_points:
+            return self._visual_only_grasp_shape(visual_axis_base, visual_axis_confidence, 0)
+        min_points = max(int(self.args.pointcloud_grasp_min_points), 6)
+        if len(roi_points) < min_points:
+            return self._visual_only_grasp_shape(
+                visual_axis_base, visual_axis_confidence, len(roi_points)
+            )
+        base_points = np.asarray(
+            [self._transform_point(transform, point) for point in roi_points],
+            dtype=np.float64,
+        )
+        finite = np.all(np.isfinite(base_points), axis=1)
+        base_points = base_points[finite]
+        if base_points.shape[0] < min_points:
+            return self._visual_only_grasp_shape(
+                visual_axis_base, visual_axis_confidence, int(base_points.shape[0])
+            )
+
+        low, high = np.percentile(base_points, [5.0, 95.0], axis=0)
+        trimmed = base_points[np.all((base_points >= low) & (base_points <= high), axis=1)]
+        if trimmed.shape[0] >= min_points:
+            base_points = trimmed
+
+        center = np.median(base_points, axis=0)
+        xy = base_points[:, :2]
+        xy_center = np.median(xy, axis=0)
+        centered_xy = xy - xy_center
+        if centered_xy.shape[0] < 3:
+            return None
+        cov = np.cov(centered_xy.T)
+        if not np.all(np.isfinite(cov)):
+            return None
+        eig_values, eig_vectors = np.linalg.eigh(cov)
+        order = np.argsort(eig_values)[::-1]
+        eig_values = eig_values[order]
+        eig_vectors = eig_vectors[:, order]
+        if float(eig_values[0]) <= 1e-10:
+            return None
+
+        major_xy = eig_vectors[:, 0].astype(np.float64)
+        major_xy /= max(float(np.linalg.norm(major_xy)), 1e-9)
+        if major_xy[0] < -1e-9 or (abs(major_xy[0]) < 1e-9 and major_xy[1] < 0.0):
+            major_xy *= -1.0
+        minor_xy = np.asarray([-major_xy[1], major_xy[0]], dtype=np.float64)
+
+        major_projection = centered_xy @ major_xy
+        minor_projection = centered_xy @ minor_xy
+        extent_major = float(np.percentile(major_projection, 90.0) - np.percentile(major_projection, 10.0))
+        extent_minor = float(np.percentile(minor_projection, 90.0) - np.percentile(minor_projection, 10.0))
+        extent_z = float(np.percentile(base_points[:, 2], 90.0) - np.percentile(base_points[:, 2], 10.0))
+        anisotropy = float((eig_values[0] - eig_values[1]) / max(eig_values[0] + eig_values[1], 1e-9))
+        density_score = min(float(base_points.shape[0]) / float(max(min_points * 2, 1)), 1.0)
+        axis_confidence = float(np.clip(anisotropy * density_score, 0.0, 1.0))
+        z_bias = min(
+            max(float(self.args.pointcloud_visible_upper_half_z_bias_ratio), 0.0)
+            * max(extent_z, 0.0),
+            max(float(self.args.pointcloud_visible_upper_half_z_bias_max), 0.0),
+        )
+        ground_limit = (
+            float(self.args.ground_min_z_base)
+            + max(float(self.args.tool_ground_clearance), 0.0)
+            + 0.01
+        )
+        z_bias = min(z_bias, max(float(center[2]) - ground_limit, 0.0))
+        shifted_center = self._apply_grasp_base_offset(
+            (float(center[0]), float(center[1]), float(center[2]))
+        )
+        return PointCloudGraspShape(
+            center_base=shifted_center,
+            major_axis_base=(float(major_xy[0]), float(major_xy[1]), 0.0),
+            minor_axis_base=(float(minor_xy[0]), float(minor_xy[1]), 0.0),
+            visual_axis_base=visual_axis_base,
+            extent_major_m=max(extent_major, 0.0),
+            extent_minor_m=max(extent_minor, 0.0),
+            extent_z_m=max(extent_z, 0.0),
+            axis_confidence=axis_confidence,
+            visual_axis_confidence=float(np.clip(visual_axis_confidence, 0.0, 1.0))
+            if visual_axis_base is not None
+            else 0.0,
+            point_count=int(base_points.shape[0]),
+            z_bias_m=max(float(z_bias), 0.0),
+        )
+
+    def _visual_only_grasp_shape(
+        self,
+        visual_axis_base: tuple[float, float, float] | None,
+        visual_axis_confidence: float,
+        point_count: int,
+    ) -> PointCloudGraspShape | None:
+        if visual_axis_base is None:
+            return None
+        return PointCloudGraspShape(
+            center_base=(0.0, 0.0, 0.0),
+            major_axis_base=visual_axis_base,
+            minor_axis_base=(-visual_axis_base[1], visual_axis_base[0], 0.0),
+            visual_axis_base=visual_axis_base,
+            extent_major_m=0.0,
+            extent_minor_m=0.0,
+            extent_z_m=0.0,
+            axis_confidence=0.0,
+            visual_axis_confidence=float(np.clip(visual_axis_confidence, 0.0, 1.0)),
+            point_count=max(int(point_count), 0),
+            z_bias_m=0.0,
+        )
+
+    def _visual_axis_base(
+        self, transform, visual_axis_camera: np.ndarray | None
+    ) -> tuple[float, float, float] | None:
+        if visual_axis_camera is None:
+            return None
+        matrix = self._matrix_from_transform(transform)
+        axis = np.asarray(matrix[:3, :3], dtype=np.float64) @ np.asarray(
+            visual_axis_camera, dtype=np.float64
+        )
+        axis[2] = 0.0
+        norm = float(np.linalg.norm(axis))
+        if norm < 1e-6:
+            return None
+        axis /= norm
+        if axis[0] < -1e-9 or (abs(axis[0]) < 1e-9 and axis[1] < 0.0):
+            axis *= -1.0
+        return (float(axis[0]), float(axis[1]), 0.0)
+
+    def _apply_visible_upper_half_bias(
+        self,
+        base_grasp_path: list[tuple[float, float, float]],
+        z_bias: float,
+    ) -> list[tuple[float, float, float]]:
+        if z_bias <= 0.0 or len(base_grasp_path) < 2:
+            return base_grasp_path
+        ground_limit = (
+            float(self.args.ground_min_z_base)
+            + max(float(self.args.tool_ground_clearance), 0.0)
+            + 0.01
+        )
+        shifted: list[tuple[float, float, float]] = []
+        for index, point in enumerate(base_grasp_path):
+            if index in {1, 2}:
+                z = max(float(point[2]) - z_bias, ground_limit)
+                shifted.append((float(point[0]), float(point[1]), z))
+            else:
+                shifted.append(point)
+        return shifted
 
     def _apply_grasp_base_offset(
         self, point_base: tuple[float, float, float]
@@ -3349,7 +4911,20 @@ class GraspPreviewNode(Node):
         keepout.scale.z = max_z - min_z
         markers.append(keepout)
 
-        label = self._marker(header, "basket_label", 31, Marker.TEXT_VIEW_FACING, _color(1.0, 1.0, 1.0))
+        rear_keepout = self._marker(
+            header, "rear_rack_keepout", 31, Marker.CUBE, _color(1.0, 0.35, 0.0, 0.14)
+        )
+        min_x, min_y, min_z = self.rear_rack_keepout_min
+        max_x, max_y, max_z = self.rear_rack_keepout_max
+        rear_keepout.pose.position = _point(
+            ((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, (min_z + max_z) * 0.5)
+        )
+        rear_keepout.scale.x = max_x - min_x
+        rear_keepout.scale.y = max_y - min_y
+        rear_keepout.scale.z = max_z - min_z
+        markers.append(rear_keepout)
+
+        label = self._marker(header, "basket_label", 32, Marker.TEXT_VIEW_FACING, _color(1.0, 1.0, 1.0))
         label.pose.position = _point((self.basket_release_base[0], self.basket_release_base[1], self.basket_release_base[2] + 0.08))
         label.scale.z = 0.055
         label.text = "release over basket\nkeepout clear" if preview.basket_safe else "basket collision risk"
@@ -3487,6 +5062,25 @@ class GraspPreviewNode(Node):
         )
         self.image_pub.publish(_image_from_bgr(image, header))
 
+    def _pointcloud_shape_payload(
+        self, shape: PointCloudGraspShape | None
+    ) -> dict[str, object] | None:
+        if shape is None:
+            return None
+        return {
+            "center_base": shape.center_base,
+            "major_axis_base": shape.major_axis_base,
+            "minor_axis_base": shape.minor_axis_base,
+            "visual_axis_base": shape.visual_axis_base,
+            "extent_major_m": shape.extent_major_m,
+            "extent_minor_m": shape.extent_minor_m,
+            "extent_z_m": shape.extent_z_m,
+            "axis_confidence": shape.axis_confidence,
+            "visual_axis_confidence": shape.visual_axis_confidence,
+            "point_count": shape.point_count,
+            "visible_upper_half_z_bias_m": shape.z_bias_m,
+        }
+
     def _save_latest(
         self, annotated: np.ndarray, raw: np.ndarray, preview: GraspPreview
     ) -> None:
@@ -3497,6 +5091,9 @@ class GraspPreviewNode(Node):
             "class_id": preview.detection.class_id,
             "confidence": preview.detection.confidence,
             "bbox_xyxy": preview.detection.xyxy,
+            "has_mask": preview.detection.mask_xy is not None,
+            "mask_area_px": preview.detection.mask_area_px,
+            "roi_source": preview.roi_source,
             "depth_m": preview.depth_m,
             "grasp_camera_xyz": preview.grasp_xyz,
             "path_camera_xyz": [
@@ -3510,9 +5107,12 @@ class GraspPreviewNode(Node):
                 "flip_y": bool(self.args.depth_projection_flip_y),
             },
             "grasp_base_offset_xyz": self.grasp_base_offset,
+            "pointcloud_grasp_shape": self._pointcloud_shape_payload(preview.pointcloud_shape),
             "planned_grasp_path_base_xyz": preview.base_path_xyz,
             "planned_grasp_path_source": (
                 "fk_from_arm_trajectory_frames" if preview.arm_trajectory_frames else "pending"
+                if not preview.base_path_xyz
+                else "cartesian_reference"
             ),
             "trajectory_segments_base": [
                 {
@@ -3555,6 +5155,15 @@ class GraspPreviewNode(Node):
             ),
             "path_playback_rate_hz": max(float(self.args.playback_rate), 1.0),
             "planner_backend": str(self.args.planner_backend),
+            "grasp_strategy": {
+                "vertical_approach": bool(self.args.vertical_approach),
+                "lock_grasp_orientation": bool(self.args.lock_grasp_orientation),
+                "tool_orientation_limit_deg": float(self.args.tool_orientation_limit_deg),
+                "max_grasp_orientation_candidates": int(self.args.max_grasp_orientation_candidates),
+                "local_strict_ik": bool(self.args.local_strict_ik),
+                "real_sdk_semantic_targets_only": bool(self.args.real_sdk_semantic_targets_only),
+                "safe_mid_lift_height_m": float(self.args.safe_mid_lift_height),
+            },
             "moveit_plan_service": str(self.args.moveit_plan_service),
             "moveit_planners": [
                 token.strip()
@@ -3568,6 +5177,15 @@ class GraspPreviewNode(Node):
                 "max_accel_rad_sec2": max(float(self.args.preview_max_joint_accel), 0.05),
                 "max_jerk_rad_sec3": max(float(self.args.preview_max_joint_jerk), 0.1),
                 "smoothing_tau_sec": max(float(self.args.preview_smoothing_tau), 0.02),
+            },
+            "ground_safety": {
+                "ground_min_z_base": float(self.args.ground_min_z_base),
+                "ground_clearance": float(self.args.ground_clearance),
+                "tool_ground_clearance": float(self.args.tool_ground_clearance),
+                "arm_collision_radius": float(self.args.arm_collision_radius),
+                "collision_margin": float(self.args.collision_margin),
+                "rear_rack_collision_margin": float(self.args.rear_rack_collision_margin),
+                "grasp_topdown_max_tilt_deg": float(self.args.grasp_topdown_max_tilt_deg),
             },
             "gripper_preview": {
                 "gripper_type": str(self.args.gripper_type),
@@ -3631,6 +5249,8 @@ class GraspPreviewNode(Node):
             "basket_release_base": self.basket_release_base,
             "basket_keepout_min_base": self.basket_keepout_min,
             "basket_keepout_max_base": self.basket_keepout_max,
+            "rear_rack_keepout_min_base": self.rear_rack_keepout_min,
+            "rear_rack_keepout_max_base": self.rear_rack_keepout_max,
             "basket_safe": preview.basket_safe,
             "roi_points": len(preview.roi_points),
         }

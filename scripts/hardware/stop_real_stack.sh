@@ -12,10 +12,32 @@ PATTERNS=(
   "/install/arachne_hardware/lib/arachne_hardware/ms42dc_official_bridge"
   "/install/arachne_hardware/lib/arachne_hardware/scout_waveshare_serial_driver"
   "/install/arachne_hardware/lib/arachne_hardware/scout_official_status_bridge"
+  "/install/arachne_sim/lib/arachne_sim/base_sim_controller"
+  "base_sim_controller"
+  "ros2 launch arachne_sensors gemini335.launch.py"
+  "/install/arachne_sensors/lib/arachne_sensors/gemini335_v4l2_node"
+  "[_]_node:=gemini335_color_tf"
+  "[_]_node:=gemini335_depth_tf"
+  "[_]_node:=arachne_calibrated_color_tf"
+  "[_]_node:=arachne_calibrated_depth_tf"
+  "static_transform_publisher.*camera_color_optical_frame"
+  "static_transform_publisher.*camera_depth_optical_frame"
   "/install/step_motor/lib/step_motor/motor_node"
   "/opt/ros/humble/lib/robot_state_publisher/robot_state_publisher"
   "ros2 launch arachne_hardware real_bringup.launch.py"
   "ros2 launch arachne_operator teach_panel.launch.py"
+  "/install/arachne_operator/lib/arachne_operator/teach_panel"
+  "rviz2.*arachne_lidar_fusion.rviz"
+  "rviz2.*arachne_nav_topdown.rviz"
+  "rviz2.*arachne_model.rviz"
+  "ros2 launch arachne_operator grasp_task_server.launch.py"
+  "/install/arachne_operator/lib/arachne_operator/grasp_task_server"
+  "/scripts/hardware/real_grasp_console.sh"
+  "/scripts/vision/grasp_preview.sh"
+  "grasp_preview_pipeline.py"
+  "raw_image_viewer.py"
+  "image_view.*arachne/grasp_preview/annotated_image"
+  "image_view.*camera/color/image_raw"
 )
 
 collect_pids() {
@@ -46,6 +68,14 @@ sleep "${GRACE_SEC}"
 for pid in "${PIDS[@]}"; do
   if kill -0 "${pid}" 2>/dev/null; then
     kill "${pid}" 2>/dev/null || true
+  fi
+done
+
+sleep 0.5
+
+for pid in "${PIDS[@]}"; do
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL "${pid}" 2>/dev/null || true
   fi
 done
 

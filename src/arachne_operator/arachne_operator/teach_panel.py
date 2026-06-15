@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import signal
+import shlex
+import socket
+import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass, fields, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -21,6 +27,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, String
+from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
@@ -46,6 +53,144 @@ DEFAULT_ARM_BASE_RPY = "0.0,0.0,1.57079632679"
 DEFAULT_REAR_RACK_KEEPOUT_MIN_XYZ = "-0.41,-0.22,0.04"
 DEFAULT_REAR_RACK_KEEPOUT_MAX_XYZ = "0.09,0.22,0.82"
 DEFAULT_TEACH_CONFIG_PATH = "recordings/teach/teach_panel_config.json"
+DEFAULT_AUBO_TEACH_FLAG_PATH = "/tmp/arachne_aubo_teach_mode"
+DEFAULT_AUBO_CONTROL_OWNER_PATH = "/tmp/arachne_aubo_control_owner"
+MANAGED_SERVICE_COMMAND_PARAMS = {
+    "camera": "camera_command",
+    "viewer": "camera_view_command",
+    "slam": "slam_command",
+    "grasp_server": "grasp_server_command",
+}
+
+
+def _control_owner_payload(owner: str) -> str:
+    return json.dumps(
+        {"owner": owner, "pid": os.getpid(), "created_at": time.time()},
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def _parse_control_owner(text: str) -> tuple[str, int | None]:
+    text = text.strip()
+    if not text:
+        return "", None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text.splitlines()[0].strip(), None
+    owner = str(data.get("owner", "")).strip()
+    pid_value = data.get("pid")
+    try:
+        pid = int(pid_value) if pid_value is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    return owner, pid
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _claim_control_owner(path: Path, owner: str) -> tuple[bool, str]:
+    owner = owner.strip() or "unknown"
+    for _attempt in range(2):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return False, f"unreadable owner file {path}: {exc}"
+            active_owner, pid = _parse_control_owner(text)
+            if active_owner == owner and pid == os.getpid():
+                return True, f"already owned by {owner}"
+            if pid is not None and not _pid_alive(pid):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    return False, f"stale owner {active_owner or text!r} could not be cleared: {exc}"
+                continue
+            pid_text = str(pid) if pid is not None else "unknown"
+            return False, f"owned by {active_owner or text.strip() or 'unknown'} pid={pid_text}"
+        except OSError as exc:
+            return False, f"could not create owner file {path}: {exc}"
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(_control_owner_payload(owner))
+        except OSError as exc:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False, f"could not write owner file {path}: {exc}"
+        return True, f"owned by {owner}"
+    return False, f"could not claim owner file {path}"
+
+
+def _release_control_owner(path: Path, owner: str) -> None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, OSError):
+        return
+    active_owner, pid = _parse_control_owner(text)
+    if active_owner != (owner.strip() or "unknown"):
+        return
+    if pid is not None and pid != os.getpid():
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
+class AuboDirectJsonRpc:
+    def __init__(self, ip: str, port: int, timeout: float) -> None:
+        self.ip = ip
+        self.port = port
+        self.timeout = timeout
+        self.request_id = 0
+        self.robot_name = "rob1"
+        self.sock: socket.socket | None = None
+
+    def __enter__(self) -> "AuboDirectJsonRpc":
+        self.sock = socket.create_connection((self.ip, self.port), timeout=self.timeout)
+        self.sock.settimeout(self.timeout)
+        names = self.call("getRobotNames")
+        if names:
+            self.robot_name = str(names[0])
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self.sock is not None:
+            self.sock.close()
+
+    def call(self, method: str, params: list[Any] | None = None) -> Any:
+        if self.sock is None:
+            raise RuntimeError("not connected")
+        self.request_id += 1
+        request = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or [],
+            "id": self.request_id,
+        }
+        self.sock.sendall(json.dumps(request, separators=(",", ":")).encode("utf-8"))
+        response = json.loads(self.sock.recv(8192).decode("utf-8", errors="replace"))
+        if response.get("error") not in (None, "", "None", "null"):
+            raise RuntimeError(f"{method} failed: {response['error']}")
+        return response.get("result")
+
+    def robot_call(self, suffix: str, params: list[Any] | None = None) -> Any:
+        return self.call(f"{self.robot_name}.{suffix}", params)
 
 
 @dataclass
@@ -170,14 +315,15 @@ class TeachPanelNode(Node):
         self.declare_parameter("arm_state_joint_names", ",".join(DEFAULT_REAL_ARM_JOINTS))
         self.declare_parameter("arm_command_joint_names", ",".join(DEFAULT_REAL_ARM_JOINTS))
         self.declare_parameter("gripper_command_topic", "/arachne/gripper/command")
-        self.declare_parameter("base_linear_speed", 0.08)
-        self.declare_parameter("base_angular_speed", 0.30)
-        self.declare_parameter("base_replay_linear_speed", 0.20)
-        self.declare_parameter("base_replay_angular_speed", 0.24)
+        self.declare_parameter("base_linear_speed", 0.16)
+        self.declare_parameter("base_angular_speed", 0.60)
+        self.declare_parameter("base_replay_linear_speed", 0.40)
+        self.declare_parameter("base_replay_angular_speed", 0.48)
         self.declare_parameter("base_position_tolerance", 0.02)
         self.declare_parameter("base_yaw_tolerance_deg", 2.0)
         self.declare_parameter("base_manual_publish_rate", 12.0)
         self.declare_parameter("base_motion_max_segment_sec", 20.0)
+        self.declare_parameter("base_ignore_spurious_zero_odom", True)
         self.declare_parameter("arm_jog_step_m", 0.008)
         self.declare_parameter("arm_jog_duration_sec", 0.24)
         self.declare_parameter("arm_rotate_step_rad", math.radians(0.7))
@@ -202,6 +348,22 @@ class TeachPanelNode(Node):
         self.declare_parameter("arm_velocity_keepout_check_interval_sec", 0.05)
         self.declare_parameter("arm_velocity_stream_deadman_sec", 0.75)
         self.declare_parameter("arm_waypoint_duration_sec", 3.75)
+        self.declare_parameter("arm_replay_backend", "sdk_move_joint")
+        self.declare_parameter("aubo_sdk_ip", os.environ.get("AUBO_ROBOT_IP", "192.168.127.128"))
+        self.declare_parameter("aubo_sdk_rpc_port", 30004)
+        self.declare_parameter("aubo_sdk_rpc_timeout_sec", 3.0)
+        self.declare_parameter("aubo_sdk_move_speed_rad_sec", 0.25)
+        self.declare_parameter("aubo_sdk_move_accel_rad_sec2", 0.45)
+        self.declare_parameter("aubo_sdk_blend_radius", 0.0)
+        self.declare_parameter("aubo_sdk_move_duration_sec", 0.0)
+        self.declare_parameter("aubo_sdk_goal_tolerance_rad", 0.04)
+        self.declare_parameter("aubo_sdk_arrival_timeout_padding_sec", 3.0)
+        self.declare_parameter("aubo_sdk_lifecycle_power_timeout_sec", 45.0)
+        self.declare_parameter("aubo_sdk_lifecycle_startup_timeout_sec", 45.0)
+        self.declare_parameter("aubo_sdk_lifecycle_poll_sec", 0.5)
+        self.declare_parameter("aubo_sdk_teach_flag_path", DEFAULT_AUBO_TEACH_FLAG_PATH)
+        self.declare_parameter("aubo_sdk_control_owner_path", DEFAULT_AUBO_CONTROL_OWNER_PATH)
+        self.declare_parameter("aubo_sdk_control_owner_name", "teach_panel")
         self.declare_parameter("arm_home_joints_deg", DEFAULT_ARM_HOME_JOINTS_DEG)
         self.declare_parameter("arm_install_joints_deg", DEFAULT_ARM_INSTALL_JOINTS_DEG)
         self.declare_parameter("aubo_payload_mass_kg", DEFAULT_AUBO_PAYLOAD_MASS_KG)
@@ -228,9 +390,47 @@ class TeachPanelNode(Node):
         self.declare_parameter("aubo_teach_command_topic", "/arachne/aubo/teach_command")
         self.declare_parameter("aubo_teach_exit_wait_sec", 8.0)
         self.declare_parameter("replay_settle_sec", 0.2)
+        self.declare_parameter("gripper_settle_sec", 2.0)
         self.declare_parameter("recording_dir", "recordings/teach")
         self.declare_parameter("teach_config_path", DEFAULT_TEACH_CONFIG_PATH)
         self.declare_parameter("teach_config_autoload", True)
+        self.declare_parameter("workspace_root", "")
+        self.declare_parameter("runtime_log_root", "log/teach_panel")
+        self.declare_parameter("service_stop_timeout_sec", 4.0)
+        self.declare_parameter(
+            "camera_command",
+            (
+                "ros2 launch arachne_sensors gemini335.launch.py "
+                "publish_pointcloud:=false with_color_view:=false with_depth_view:=false "
+                "with_tf:=true camera_parent_frame:=ee_camera_link "
+                "projection_flip_x:=true projection_flip_y:=true"
+            ),
+        )
+        self.declare_parameter(
+            "camera_view_command",
+            (
+                "${ARACHNE_SYSTEM_PYTHON:-python3} scripts/vision/raw_image_viewer.py "
+                "--topic /camera/color/image_raw --window \"Arachne Raw Camera\" --max-fps 15"
+            ),
+        )
+        self.declare_parameter("slam_command", "scripts/hardware/real_lidar_nav.sh")
+        self.declare_parameter(
+            "grasp_server_command",
+            (
+                "scripts/vision/grasp_task_server.sh "
+                "execute_real:=true confirm_execute_real:=true with_rviz:=false "
+                "preview_on_start:=false planning_recovery_base_enabled:=false "
+                "require_odom:=false require_camera_topics:=true "
+                "require_aubo_status:=false require_gripper_status:=false "
+                "max_grasp_attempts:=3 retry_on_gripper_miss:=true"
+            ),
+        )
+        self.declare_parameter("grasp_task_state_topic", "/arachne/grasp_task/state")
+        self.declare_parameter("grasp_task_start_service", "/arachne/grasp_task/start")
+        self.declare_parameter("grasp_task_stop_service", "/arachne/grasp_task/stop")
+        self.declare_parameter("grasp_task_restore_service", "/arachne/grasp_task/restore")
+        self.declare_parameter("grasp_task_status_service", "/arachne/grasp_task/status")
+        self.declare_parameter("grasp_task_preflight_service", "/arachne/grasp_task/preflight")
 
         self.arm_state_joint_names = _parse_names(str(self.get_parameter("arm_state_joint_names").value))
         self.arm_command_joint_names = _parse_names(
@@ -268,6 +468,23 @@ class TeachPanelNode(Node):
             FollowJointTrajectory,
             str(self.get_parameter("arm_follow_joint_trajectory_action").value),
         )
+        self.grasp_task_clients = {
+            "start": self.create_client(
+                Trigger, str(self.get_parameter("grasp_task_start_service").value)
+            ),
+            "stop": self.create_client(
+                Trigger, str(self.get_parameter("grasp_task_stop_service").value)
+            ),
+            "restore": self.create_client(
+                Trigger, str(self.get_parameter("grasp_task_restore_service").value)
+            ),
+            "status": self.create_client(
+                Trigger, str(self.get_parameter("grasp_task_status_service").value)
+            ),
+            "preflight": self.create_client(
+                Trigger, str(self.get_parameter("grasp_task_preflight_service").value)
+            ),
+        }
 
         self.create_subscription(Odometry, odom_topic, self._odom_callback, 10)
         self.create_subscription(JointState, joint_states_topic, self._joint_state_callback, 10)
@@ -276,6 +493,12 @@ class TeachPanelNode(Node):
         self.create_subscription(
             String, "/arachne/hardware/gripper_status", self._gripper_status_callback, 10
         )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("grasp_task_state_topic").value),
+            self._grasp_task_state_callback,
+            10,
+        )
 
         self.kinematics = AuboI5Kinematics()
         self.lock = threading.Lock()
@@ -283,6 +506,7 @@ class TeachPanelNode(Node):
         self.base_pose: Pose2D | None = None
         self.base_motion_segments: list[dict] = []
         self.active_base_motion: dict | None = None
+        self.base_motion_recording_enabled = False
         self.manual_base_velocity: tuple[float, float] | None = None
         self.manual_arm_stream_command: dict[str, object] | None = None
         self.manual_arm_stream_deadline = 0.0
@@ -297,7 +521,12 @@ class TeachPanelNode(Node):
         self.current_arm: dict[str, float] = {}
         self.tool_position: tuple[float, float, float] | None = None
         self.gripper_state = "open"
-        self.hardware_status = {"Base": "waiting", "Aubo": "waiting", "Gripper": "waiting"}
+        self.hardware_status = {
+            "Base": "waiting",
+            "Aubo": "waiting",
+            "Gripper": "waiting",
+            "Grasp": "waiting",
+        }
         self.aubo_teach_gate_active = False
         self.aubo_teach_ready_event = threading.Event()
         self.aubo_teach_ready_event.set()
@@ -307,18 +536,94 @@ class TeachPanelNode(Node):
         self.replay_thread: threading.Thread | None = None
         self._active_goal_handle = None
         self._last_manual_arm_stream_status = 0.0
+        self.workspace_root = self._resolve_workspace_root()
+        self.runtime_log_dir = self._make_runtime_log_dir()
+        self.event_log_path = self.runtime_log_dir / "events.jsonl"
+        self.managed_processes: dict[str, subprocess.Popen] = {}
+        self.managed_process_logs: dict[str, Path] = {}
+        self.managed_process_log_handles: dict[str, Any] = {}
+        self.last_logged_hardware_status: dict[str, str] = {}
         if bool(self.get_parameter("teach_config_autoload").value):
             self.load_teach_config(status=False)
         publish_rate = max(float(self.get_parameter("base_manual_publish_rate").value), 1.0)
         self.create_timer(1.0 / publish_rate, self._publish_manual_base_velocity)
         arm_velocity_rate = max(float(self.get_parameter("arm_velocity_publish_rate").value), 1.0)
         self.create_timer(1.0 / arm_velocity_rate, self._publish_manual_arm_velocity)
-        self._status("ready")
+        self._status(f"ready; logs={self.runtime_log_dir}")
+
+    def _resolve_workspace_root(self) -> Path:
+        configured = str(self.get_parameter("workspace_root").value).strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        for parent in Path(__file__).resolve().parents:
+            if (parent / "scripts/env/arachne_env.sh").exists():
+                return parent
+        return Path.cwd().resolve()
+
+    def _workspace_path(self, path: str | Path) -> Path:
+        resolved = Path(str(path)).expanduser()
+        if not resolved.is_absolute():
+            resolved = self.workspace_root / resolved
+        return resolved
+
+    def _make_runtime_log_dir(self) -> Path:
+        root = self._workspace_path(str(self.get_parameter("runtime_log_root").value))
+        directory = root / datetime.now().strftime("%Y%m%d_%H%M%S")
+        directory.mkdir(parents=True, exist_ok=True)
+        latest = root / "latest"
+        try:
+            latest.unlink(missing_ok=True)
+            latest.symlink_to(directory)
+        except OSError:
+            pass
+        return directory
+
+    def _write_event(self, kind: str, message: str, **fields: Any) -> None:
+        path = getattr(self, "event_log_path", None)
+        if path is None:
+            return
+        payload = {
+            "stamp": datetime.now().isoformat(timespec="milliseconds"),
+            "kind": kind,
+            "message": str(message),
+            **fields,
+        }
+        try:
+            with Path(path).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError as exc:
+            self.get_logger().warning(f"teach event log write failed: {exc}")
+
+    def _log_hardware_status_change(self, key: str, value: str) -> None:
+        previous = self.last_logged_hardware_status.get(key)
+        if previous == value:
+            return
+        self.last_logged_hardware_status[key] = value
+        self._write_event("hardware_status", value, key=key)
 
     def _odom_callback(self, msg: Odometry) -> None:
         pose = Pose2D(msg.pose.pose.position.x, msg.pose.pose.position.y, _yaw_from_odom(msg))
         with self.lock:
+            if self._looks_like_spurious_zero_odom_locked(pose):
+                return
             self.base_pose = pose
+
+    def _looks_like_spurious_zero_odom_locked(self, pose: Pose2D) -> bool:
+        if not bool(self.get_parameter("base_ignore_spurious_zero_odom").value):
+            return False
+        current = self.base_pose
+        if current is None:
+            return False
+        incoming_near_zero = (
+            abs(pose.x) < 1e-4 and abs(pose.y) < 1e-4 and abs(pose.yaw) < math.radians(0.05)
+        )
+        if not incoming_near_zero:
+            return False
+        current_nonzero = (
+            math.hypot(current.x, current.y) > 0.02
+            or abs(current.yaw) > math.radians(2.0)
+        )
+        return current_nonzero
 
     def _joint_state_callback(self, msg: JointState) -> None:
         positions = dict(zip(msg.name, msg.position))
@@ -343,10 +648,12 @@ class TeachPanelNode(Node):
 
     def _status_callback(self, key: str):
         def callback(msg: String) -> None:
+            data = msg.data
             with self.lock:
-                self.hardware_status[key] = msg.data
+                self.hardware_status[key] = data
                 if key == "Aubo":
-                    self._update_aubo_teach_state_locked(msg.data)
+                    self._update_aubo_teach_state_locked(data)
+            self._log_hardware_status_change(key, data)
 
         return callback
 
@@ -366,12 +673,31 @@ class TeachPanelNode(Node):
             self.hardware_status["Gripper"] = data
             if first in ("open", "close", "stop"):
                 self.gripper_state = first
+        self._log_hardware_status_change("Gripper", data)
+
+    def _grasp_task_state_callback(self, msg: String) -> None:
+        data = msg.data.strip()
+        label = data
+        try:
+            payload = json.loads(data)
+            state = str(payload.get("state", "unknown"))
+            message = str(payload.get("message", "")).strip()
+            label = f"{state}: {message}" if message else state
+        except json.JSONDecodeError:
+            pass
+        with self.lock:
+            self.hardware_status["Grasp"] = label
+        self._log_hardware_status_change("Grasp", label)
 
     def snapshot(self) -> dict[str, str]:
         with self.lock:
             base = self.base_pose
             tool = self.tool_position
             arm_ready = self._current_arm_vector_locked() is not None
+            managed = {
+                key: self._managed_process_status_locked(key)
+                for key in MANAGED_SERVICE_COMMAND_PARAMS
+            }
             return {
                 "base": (
                     f"x={base.x:.3f} y={base.y:.3f} yaw={math.degrees(base.yaw):.1f}deg"
@@ -386,7 +712,13 @@ class TeachPanelNode(Node):
                 "arm": "ready" if arm_ready else "waiting",
                 "gripper": self.gripper_state,
                 "teach": "on" if self.aubo_teach_gate_active else "off",
+                "grasp_task": self.hardware_status.get("Grasp", "waiting"),
                 "status": self.last_status,
+                "camera": managed["camera"],
+                "viewer": managed["viewer"],
+                "slam": managed["slam"],
+                "grasp_server": managed["grasp_server"],
+                "log_dir": str(self.runtime_log_dir),
                 **self.hardware_status,
             }
 
@@ -406,16 +738,14 @@ class TeachPanelNode(Node):
             return list(self.log_lines)
 
     def recording_dir(self) -> Path:
-        directory = Path(str(self.get_parameter("recording_dir").value))
-        if not directory.is_absolute():
-            directory = Path.cwd() / directory
+        directory = self._workspace_path(str(self.get_parameter("recording_dir").value))
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
     def teach_config_path(self, path: str | Path | None = None) -> Path:
-        config_path = Path(str(path if path is not None else self.get_parameter("teach_config_path").value))
-        if not config_path.is_absolute():
-            config_path = Path.cwd() / config_path
+        config_path = self._workspace_path(
+            str(path if path is not None else self.get_parameter("teach_config_path").value)
+        )
         config_path.parent.mkdir(parents=True, exist_ok=True)
         return config_path
 
@@ -445,6 +775,7 @@ class TeachPanelNode(Node):
                 "arm_waypoint_duration_sec": float(
                     self.get_parameter("arm_waypoint_duration_sec").value
                 ),
+                "gripper_settle_sec": float(self.get_parameter("gripper_settle_sec").value),
             },
             "poses": {
                 "home_joints_deg": str(self.get_parameter("arm_home_joints_deg").value),
@@ -590,6 +921,16 @@ class TeachPanelNode(Node):
                         motion.get(
                             "arm_waypoint_duration_sec",
                             self.get_parameter("arm_waypoint_duration_sec").value,
+                        )
+                    ),
+                ),
+                Parameter(
+                    "gripper_settle_sec",
+                    Parameter.Type.DOUBLE,
+                    float(
+                        motion.get(
+                            "gripper_settle_sec",
+                            self.get_parameter("gripper_settle_sec").value,
                         )
                     ),
                 ),
@@ -784,6 +1125,105 @@ class TeachPanelNode(Node):
         msg.data = command
         self.aubo_teach_pub.publish(msg)
 
+    def command_aubo_lifecycle(self, command: str) -> None:
+        command = str(command).strip().lower()
+        if command not in {"power_on", "startup", "power_off"}:
+            self._status(f"aubo lifecycle ignored unknown command: {command}", warn=True)
+            return
+        self._start_worker(lambda: self._aubo_lifecycle_worker(command))
+
+    def _aubo_lifecycle_worker(self, command: str) -> None:
+        self.drive_base_manual("stop")
+        self.stop_arm_velocity_hold()
+        if command == "power_off":
+            self.cancel_event.set()
+        else:
+            self.cancel_event.clear()
+        ip = str(self.get_parameter("aubo_sdk_ip").value)
+        port = int(self.get_parameter("aubo_sdk_rpc_port").value)
+        timeout = max(float(self.get_parameter("aubo_sdk_rpc_timeout_sec").value), 0.1)
+        power_timeout = max(
+            float(self.get_parameter("aubo_sdk_lifecycle_power_timeout_sec").value), 1.0
+        )
+        startup_timeout = max(
+            float(self.get_parameter("aubo_sdk_lifecycle_startup_timeout_sec").value), 1.0
+        )
+        poll = max(float(self.get_parameter("aubo_sdk_lifecycle_poll_sec").value), 0.05)
+        try:
+            with AuboDirectJsonRpc(ip, port, timeout) as rpc:
+                mode = str(rpc.robot_call("RobotState.getRobotModeType"))
+                safety = str(rpc.robot_call("RobotState.getSafetyModeType"))
+                self._status(f"Aubo lifecycle {command}: mode={mode} safety={safety}")
+                if command == "power_on":
+                    if mode in {"Idle", "Running"}:
+                        self._status(f"Aubo already {mode}")
+                        return
+                    self._publish_aubo_zero_velocity("before power_on")
+                    result = rpc.robot_call("RobotManage.poweron")
+                    self._status(f"Aubo power_on result={result}")
+                    self._sdk_wait_mode(rpc, {"Idle", "Running"}, power_timeout, poll, "power_on")
+                    return
+
+                if command == "startup":
+                    self._publish_aubo_zero_velocity("before startup")
+                    if mode not in {"Idle", "Running"}:
+                        result = rpc.robot_call("RobotManage.poweron")
+                        self._status(f"Aubo power_on result={result}")
+                        self._sdk_wait_mode(rpc, {"Idle", "Running"}, power_timeout, poll, "power_on")
+                    mode = str(rpc.robot_call("RobotState.getRobotModeType"))
+                    if mode != "Running":
+                        result = rpc.robot_call("RobotManage.startup")
+                        self._status(f"Aubo startup result={result}")
+                        self._sdk_wait_mode(rpc, {"Running"}, startup_timeout, poll, "startup")
+                    self._publish_aubo_zero_velocity("after startup")
+                    self._status("Aubo startup complete")
+                    return
+
+                self._sdk_stop_joint(rpc, "power_off", warn_only=True)
+                result = self._aubo_power_off_call(rpc)
+                self._status(f"Aubo power_off result={result}")
+        except Exception as exc:
+            self._status(f"Aubo lifecycle {command} failed: {exc}", warn=True)
+
+    def _publish_aubo_zero_velocity(self, reason: str) -> None:
+        msg = Float64MultiArray()
+        msg.data = [0.0] * len(self.arm_command_joint_names)
+        self.arm_velocity_pub.publish(msg)
+        self._status(f"Aubo zero velocity hold: {reason}")
+
+    def _aubo_power_off_call(self, rpc: AuboDirectJsonRpc) -> Any:
+        last_error: Exception | None = None
+        for method in ("RobotManage.poweroff", "RobotManage.powerOff"):
+            try:
+                return rpc.robot_call(method)
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"power_off RPC unavailable: {last_error}")
+
+    def _sdk_wait_mode(
+        self,
+        rpc: AuboDirectJsonRpc,
+        expected: set[str],
+        timeout_sec: float,
+        poll_sec: float,
+        label: str,
+    ) -> str:
+        deadline = time.monotonic() + max(float(timeout_sec), 0.0)
+        last_mode = ""
+        last_safety = ""
+        while time.monotonic() < deadline and not self.cancel_event.is_set():
+            last_mode = str(rpc.robot_call("RobotState.getRobotModeType"))
+            last_safety = str(rpc.robot_call("RobotState.getSafetyModeType"))
+            if last_mode in expected:
+                self._status(f"Aubo {label} reached {last_mode}")
+                return last_mode
+            time.sleep(max(float(poll_sec), 0.05))
+        if self.cancel_event.is_set():
+            raise RuntimeError(f"Aubo {label} cancelled")
+        raise TimeoutError(
+            f"Aubo {label} timeout: mode={last_mode or 'unknown'} safety={last_safety or 'unknown'}"
+        )
+
     def _aubo_teach_gate_may_be_active(self) -> bool:
         with self.lock:
             if self.aubo_teach_gate_active:
@@ -804,6 +1244,162 @@ class TeachPanelNode(Node):
         self._status(f"aubo teach_off timeout before replay: {status}", warn=True)
         return False
 
+    def call_grasp_task(self, command: str) -> None:
+        command = str(command).strip().lower()
+        if command not in self.grasp_task_clients:
+            self._status(f"grasp task ignored unknown command: {command}", warn=True)
+            return
+        self._start_worker(lambda: self._call_grasp_task_worker(command))
+
+    def visual_grasp_start(self) -> None:
+        self._start_worker(self._visual_grasp_start_worker)
+
+    def _visual_grasp_start_worker(self) -> None:
+        self.drive_base_manual("stop")
+        self.stop_arm_velocity_hold()
+        if self._aubo_teach_gate_may_be_active():
+            self._publish_aubo_teach_command("teach_off")
+            ready = self.aubo_teach_ready_event.wait(
+                max(float(self.get_parameter("aubo_teach_exit_wait_sec").value), 0.0)
+            )
+            if not ready or self._aubo_teach_gate_may_be_active():
+                self._status("visual grasp blocked: Aubo teach mode still active", warn=True)
+                return
+
+        self._status("visual grasp: starting camera, raw view, and grasp server")
+        self._start_managed_process_worker("camera")
+        time.sleep(0.8)
+        self._start_managed_process_worker("viewer")
+        self._start_managed_process_worker("grasp_server")
+
+        preflight = self.grasp_task_clients.get("preflight")
+        if preflight is None:
+            self._status("visual grasp blocked: missing preflight client", warn=True)
+            return
+        service_name = getattr(preflight, "srv_name", "preflight")
+        if not preflight.wait_for_service(timeout_sec=15.0):
+            self._status(f"visual grasp blocked: preflight unavailable: {service_name}", warn=True)
+            return
+
+        deadline = time.monotonic() + 30.0
+        last_message = ""
+        while time.monotonic() < deadline:
+            future = preflight.call_async(Trigger.Request())
+            if not self._wait_service_future(future, 5.0):
+                last_message = f"preflight timeout: {service_name}"
+                self._status(f"visual grasp: {last_message}", warn=True)
+                time.sleep(0.5)
+                continue
+            response = future.result()
+            success = bool(response.success) if response is not None else False
+            message = response.message if response is not None else "empty response"
+            if success:
+                self._status("visual grasp: preflight ok, starting task")
+                self._call_grasp_task_worker("start")
+                return
+
+            failures = self._required_preflight_failures(message)
+            last_message = self._format_preflight_failures(failures, message)
+            failure_names = {str(item.get("name", "")) for item in failures}
+            if failure_names and failure_names <= {"color_image", "depth_image"}:
+                self._status(f"visual grasp: waiting for camera/depth ({last_message})")
+                time.sleep(0.8)
+                continue
+            self._status(f"visual grasp blocked: {last_message}", warn=True)
+            return
+
+        self._status(f"visual grasp blocked: preflight never became ready ({last_message})", warn=True)
+
+    def _call_grasp_task_worker(self, command: str) -> None:
+        client = self.grasp_task_clients.get(command)
+        if client is None:
+            self._status(f"grasp task service missing: {command}", warn=True)
+            return
+        if command == "start":
+            self.drive_base_manual("stop")
+            self.stop_arm_velocity_hold()
+            if self._aubo_teach_gate_may_be_active():
+                self._publish_aubo_teach_command("teach_off")
+                ready = self.aubo_teach_ready_event.wait(
+                    max(float(self.get_parameter("aubo_teach_exit_wait_sec").value), 0.0)
+                )
+                if not ready or self._aubo_teach_gate_may_be_active():
+                    self._status("grasp task start blocked: Aubo teach mode still active", warn=True)
+                    return
+        if command in {"stop", "restore"}:
+            self.drive_base_manual("stop")
+            self.stop_arm_velocity_hold()
+
+        service_name = getattr(client, "srv_name", command)
+        self._status(f"grasp task {command} requested")
+        if not client.wait_for_service(timeout_sec=1.5):
+            self._status(f"grasp task {command} unavailable: {service_name}", warn=True)
+            return
+        future = client.call_async(Trigger.Request())
+        if not self._wait_service_future(future, 8.0):
+            self._status(f"grasp task {command} timeout: {service_name}", warn=True)
+            return
+        response = future.result()
+        success = bool(response.success) if response is not None else False
+        message = response.message if response is not None else "empty response"
+        self._status(
+            f"grasp task {command} {'ok' if success else 'failed'}: "
+            f"{self._short_grasp_task_message(message)}",
+            warn=not success,
+        )
+
+    def _wait_service_future(self, future, timeout_sec: float) -> bool:
+        deadline = time.monotonic() + max(float(timeout_sec), 0.0)
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return future.done()
+
+    def _short_grasp_task_message(self, message: str) -> str:
+        text = str(message).strip()
+        if not text:
+            return ""
+        try:
+            payload = json.loads(text)
+            state = str(payload.get("state", "")).strip()
+            detail = str(payload.get("message", "")).strip()
+            task_id = str(payload.get("task_id", "")).strip()
+            parts = [part for part in (state, detail, task_id) if part]
+            if parts:
+                return " | ".join(parts)
+        except json.JSONDecodeError:
+            pass
+        return text[:180]
+
+    def _required_preflight_failures(self, message: str) -> list[dict[str, Any]]:
+        try:
+            payload = json.loads(str(message))
+        except json.JSONDecodeError:
+            return [{"name": "preflight", "message": str(message), "required": True}]
+        checks = payload.get("checks", [])
+        if not isinstance(checks, list):
+            return [{"name": "preflight", "message": str(message), "required": True}]
+        failures: list[dict[str, Any]] = []
+        for item in checks:
+            if not isinstance(item, dict):
+                continue
+            if bool(item.get("required", True)) and not bool(item.get("ok", False)):
+                failures.append(item)
+        return failures
+
+    def _format_preflight_failures(
+        self, failures: list[dict[str, Any]], fallback: str
+    ) -> str:
+        if not failures:
+            return self._short_grasp_task_message(fallback)
+        parts = []
+        for item in failures[:4]:
+            name = str(item.get("name", "check")).strip()
+            message = str(item.get("message", "")).strip()
+            parts.append(f"{name}: {message}" if message else name)
+        if len(failures) > 4:
+            parts.append(f"+{len(failures) - 4} more")
+        return "; ".join(parts)
+
     def jog_arm(self, axis: str, sign: float) -> None:
         self.cancel_event.clear()
         if axis not in ("x", "y", "z"):
@@ -818,6 +1414,9 @@ class TeachPanelNode(Node):
     def _track_base_motion(self, direction: str, linear_x: float, angular_z: float) -> None:
         now = time.monotonic()
         with self.lock:
+            if not self.base_motion_recording_enabled:
+                self._close_base_motion_locked(now)
+                return
             if direction == "stop" or (abs(linear_x) < 1e-9 and abs(angular_z) < 1e-9):
                 self._close_base_motion_locked(now)
                 return
@@ -830,6 +1429,22 @@ class TeachPanelNode(Node):
                 "start_stamp": datetime.now().isoformat(timespec="seconds"),
                 "_start_monotonic": now,
             }
+
+    def set_base_motion_recording(self, enabled: bool) -> None:
+        now = time.monotonic()
+        with self.lock:
+            self._close_base_motion_locked(now)
+            self.base_motion_recording_enabled = bool(enabled)
+            count = len(self.base_motion_segments)
+        state = "on" if enabled else "off"
+        self._status(f"program base recording {state}; pending base segments={count}")
+
+    def base_motion_recording_state(self) -> tuple[bool, int]:
+        with self.lock:
+            return (
+                self.base_motion_recording_enabled,
+                len(self.base_motion_segments) + (1 if self.active_base_motion is not None else 0),
+            )
 
     def _publish_manual_base_velocity(self) -> None:
         with self.lock:
@@ -1463,8 +2078,10 @@ class TeachPanelNode(Node):
     def _replay_worker(self, waypoints: list[TeachWaypoint]) -> None:
         self._status(f"replay started: {len(waypoints)} waypoints")
         try:
-            if not self._ensure_aubo_motion_ready():
+            if self._replay_has_arm_targets(waypoints) and not self._ensure_aubo_motion_ready():
                 raise RuntimeError("Aubo teach mode is still active")
+            replay_gripper = self.gripper_state
+            previous_arm_joints: list[float] | None = None
             for index, waypoint in enumerate(waypoints, start=1):
                 if self.cancel_event.is_set():
                     break
@@ -1477,16 +2094,73 @@ class TeachPanelNode(Node):
 
                 if waypoint.base_motion:
                     self._replay_base_motion(waypoint.base_motion, waypoint.label)
-                if waypoint.gripper in ("open", "close"):
+                if self._valid_arm_target(waypoint.arm_joints):
+                    if previous_arm_joints is None:
+                        previous_arm_joints = self._current_arm_vector()
+                    if previous_arm_joints is None:
+                        raise RuntimeError(f"missing arm joint state before {waypoint.label}")
+                    target_arm_joints = [float(value) for value in waypoint.arm_joints]
+                    arm_delta = self._max_arm_delta(previous_arm_joints, target_arm_joints)
+                    skip_tolerance = max(
+                        float(self.get_parameter("arm_goal_tolerance").value) * 0.5,
+                        1e-4,
+                    )
+                    if arm_delta > skip_tolerance:
+                        if not self._replay_arm_waypoint(
+                            previous_arm_joints, target_arm_joints, waypoint.label
+                        ):
+                            raise RuntimeError(f"arm waypoint failed: {waypoint.label}")
+                    else:
+                        self._status(
+                            f"arm replay skipped: unchanged target for {waypoint.label}"
+                        )
+                    previous_arm_joints = target_arm_joints
+                elif waypoint.arm_joints:
+                    self._status(
+                        f"arm replay skipped: invalid joint target for {waypoint.label}",
+                        warn=True,
+                    )
+                if waypoint.gripper in ("open", "close") and waypoint.gripper != replay_gripper:
                     self.publish_gripper(waypoint.gripper)
-                if not self._move_arm_to_positions_velocity(waypoint.arm_joints, waypoint.label):
-                    raise RuntimeError(f"arm waypoint failed: {waypoint.label}")
+                    replay_gripper = waypoint.gripper
+                    gripper_wait = max(float(self.get_parameter("gripper_settle_sec").value), 0.0)
+                    if gripper_wait > 0.0:
+                        self._status(f"gripper settle {gripper_wait:.1f}s: {waypoint.gripper}")
+                        self._sleep(gripper_wait)
                 self._sleep(float(self.get_parameter("replay_settle_sec").value))
             self.set_base_velocity(0.0, 0.0)
             self._status("replay complete" if not self.cancel_event.is_set() else "replay stopped")
         except Exception as exc:
             self.set_base_velocity(0.0, 0.0)
             self._status(f"replay failed: {exc}", warn=True)
+
+    def _replay_has_arm_targets(self, waypoints: list[TeachWaypoint]) -> bool:
+        return any(
+            waypoint.kind != "wait" and self._valid_arm_target(waypoint.arm_joints)
+            for waypoint in waypoints
+        )
+
+    def _valid_arm_target(self, target: list[float]) -> bool:
+        if not isinstance(target, list):
+            return False
+        if len(target) != len(self.arm_command_joint_names):
+            return False
+        try:
+            values = [float(value) for value in target]
+        except (TypeError, ValueError):
+            return False
+        return all(math.isfinite(value) for value in values)
+
+    def _max_arm_delta(self, start: list[float], target: list[float]) -> float:
+        if len(start) != len(target):
+            return math.inf
+        return max(
+            (
+                abs(_angle_diff(float(target_value), float(start_value)))
+                for start_value, target_value in zip(start, target)
+            ),
+            default=0.0,
+        )
 
     def _replay_base_motion(self, segments: list[dict], label: str) -> None:
         max_duration = float(self.get_parameter("base_motion_max_segment_sec").value)
@@ -1705,6 +2379,7 @@ class TeachPanelNode(Node):
         *,
         wait: bool,
         velocities: list[float] | None = None,
+        accelerations: list[float] | None = None,
         manual_stream: bool = False,
     ) -> bool:
         if label != "hold current":
@@ -1723,8 +2398,11 @@ class TeachPanelNode(Node):
             if velocities is not None and len(velocities) == len(point.positions)
             else [0.0 for _ in point.positions]
         )
-        if not manual_stream:
-            point.accelerations = [0.0 for _ in point.positions]
+        point.accelerations = (
+            [float(value) for value in accelerations]
+            if accelerations is not None and len(accelerations) == len(point.positions)
+            else [0.0 for _ in point.positions]
+        )
         point.time_from_start.sec = int(duration)
         point.time_from_start.nanosec = int((duration % 1.0) * 1e9)
         trajectory.points = [point]
@@ -1785,18 +2463,329 @@ class TeachPanelNode(Node):
             self._sleep(duration)
         return True
 
+    def _replay_arm_waypoint(self, start: list[float], target: list[float], label: str) -> bool:
+        backend = str(self.get_parameter("arm_replay_backend").value).strip().lower()
+        if backend in ("sdk", "sdk_move_joint", "movejoint", "move_joint"):
+            return self._send_arm_sdk_move_joint(target, label)
+        if backend in ("velocity", "velocity_stream", "stream"):
+            return self._send_arm_replay_segment(start, target, label)
+        self._status(f"unknown arm replay backend {backend!r}; using sdk_move_joint", warn=True)
+        return self._send_arm_sdk_move_joint(target, label)
+
+    def _send_arm_sdk_move_joint(self, target: list[float], label: str) -> bool:
+        if len(target) != len(self.arm_command_joint_names):
+            self._status(f"Aubo SDK moveJoint skipped: invalid joint target for {label}", warn=True)
+            return False
+        violation = self._arm_keepout_violation(target, label)
+        if violation is not None:
+            self._status(f"Aubo SDK moveJoint blocked by safety zone: {violation}", warn=True)
+            return False
+
+        ip = str(self.get_parameter("aubo_sdk_ip").value)
+        port = int(self.get_parameter("aubo_sdk_rpc_port").value)
+        timeout = max(float(self.get_parameter("aubo_sdk_rpc_timeout_sec").value), 0.1)
+        speed = max(float(self.get_parameter("aubo_sdk_move_speed_rad_sec").value), 0.01)
+        accel = max(float(self.get_parameter("aubo_sdk_move_accel_rad_sec2").value), 0.05)
+        blend_radius = max(float(self.get_parameter("aubo_sdk_blend_radius").value), 0.0)
+        duration = max(float(self.get_parameter("aubo_sdk_move_duration_sec").value), 0.0)
+        owner_owned = False
+        gate_owned = False
+
+        self._status(
+            f"Aubo SDK moveJoint: {label} speed={speed:.3f} accel={accel:.3f}"
+        )
+        try:
+            with AuboDirectJsonRpc(ip, port, timeout) as rpc:
+                self._sdk_require_running(rpc)
+                owner_owned = self._sdk_enter_control_owner()
+                gate_owned = self._sdk_enter_gate()
+                self._sdk_exit_servo_mode(rpc)
+                self._sdk_stop_joint(rpc, "pre-move cleanup", warn_only=True)
+                result = rpc.robot_call(
+                    "MotionControl.moveJoint",
+                    [[float(value) for value in target], accel, speed, blend_radius, duration],
+                )
+                if result not in (0, None):
+                    self._status(f"Aubo SDK moveJoint failed at {label}: result={result}", warn=True)
+                    return False
+                self._sdk_wait_exec_complete(rpc, label)
+                return self._sdk_wait_arrival(rpc, np.asarray(target, dtype=float), label)
+        except Exception as exc:
+            self._status(f"Aubo SDK moveJoint failed at {label}: {exc}", warn=True)
+            return False
+        finally:
+            if gate_owned:
+                try:
+                    with AuboDirectJsonRpc(ip, port, timeout) as rpc:
+                        self._sdk_stop_joint(rpc, "post-move cleanup", warn_only=True)
+                except Exception:
+                    pass
+            self._sdk_exit_gate(gate_owned)
+            self._sdk_exit_control_owner(owner_owned)
+
+    def _sdk_require_running(self, rpc: AuboDirectJsonRpc) -> None:
+        mode = str(rpc.robot_call("RobotState.getRobotModeType")).strip().lower()
+        safety = str(rpc.robot_call("RobotState.getSafetyModeType")).strip().lower()
+        if mode != "running" or safety not in ("normal", "reducedmode"):
+            raise RuntimeError(f"Aubo not ready: mode={mode} safety={safety}")
+
+    def _sdk_enter_control_owner(self) -> bool:
+        path = Path(str(self.get_parameter("aubo_sdk_control_owner_path").value))
+        owner = str(self.get_parameter("aubo_sdk_control_owner_name").value).strip() or "teach_panel"
+        ok, message = _claim_control_owner(path, owner)
+        if not ok:
+            raise RuntimeError(f"Aubo control owner unavailable: {message}")
+        return True
+
+    def _sdk_exit_control_owner(self, owner_owned: bool) -> None:
+        if not owner_owned:
+            return
+        path = Path(str(self.get_parameter("aubo_sdk_control_owner_path").value))
+        owner = str(self.get_parameter("aubo_sdk_control_owner_name").value).strip() or "teach_panel"
+        _release_control_owner(path, owner)
+
+    def _sdk_enter_gate(self) -> bool:
+        path = Path(str(self.get_parameter("aubo_sdk_teach_flag_path").value))
+        try:
+            path.write_text("1\n", encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"failed to set Aubo teach gate {path}: {exc}") from exc
+        time.sleep(0.15)
+        return True
+
+    def _sdk_exit_gate(self, gate_owned: bool) -> None:
+        if not gate_owned:
+            return
+        path = Path(str(self.get_parameter("aubo_sdk_teach_flag_path").value))
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._status(f"failed to release Aubo teach gate {path}: {exc}", warn=True)
+
+    def _sdk_exit_servo_mode(self, rpc: AuboDirectJsonRpc) -> None:
+        try:
+            result = rpc.robot_call("MotionControl.setServoModeSelect", [0])
+            if result not in (0, None):
+                self._status(f"Aubo SDK setServoModeSelect(0) result={result}", warn=True)
+            return
+        except Exception as exc:
+            self._status(
+                f"Aubo SDK setServoModeSelect unavailable, trying setServoMode(false): {exc}",
+                warn=True,
+            )
+        result = rpc.robot_call("MotionControl.setServoMode", [False])
+        if result not in (0, None):
+            self._status(f"Aubo SDK setServoMode(false) result={result}", warn=True)
+
+    def _sdk_stop_joint(
+        self, rpc: AuboDirectJsonRpc, reason: str, *, warn_only: bool = False
+    ) -> None:
+        accel = max(float(self.get_parameter("aubo_sdk_move_accel_rad_sec2").value), 0.05)
+        try:
+            result = rpc.robot_call("MotionControl.stopJoint", [accel])
+        except Exception as exc:
+            if warn_only:
+                self._status(f"Aubo SDK stopJoint failed during {reason}: {exc}", warn=True)
+                return
+            raise
+        if result not in (0, None):
+            message = f"Aubo SDK stopJoint result={result} during {reason}"
+            if warn_only:
+                self._status(message, warn=True)
+            else:
+                raise RuntimeError(message)
+
+    def _sdk_wait_exec_complete(self, rpc: AuboDirectJsonRpc, label: str) -> None:
+        timeout = max(float(self.get_parameter("arm_waypoint_duration_sec").value), 0.5) + 8.0
+        deadline = time.monotonic() + timeout
+        exec_id = rpc.robot_call("MotionControl.getExecId")
+        start_deadline = time.monotonic() + 0.5
+        while exec_id == -1 and time.monotonic() < start_deadline and not self.cancel_event.is_set():
+            time.sleep(0.05)
+            exec_id = rpc.robot_call("MotionControl.getExecId")
+        while exec_id != -1 and time.monotonic() < deadline and not self.cancel_event.is_set():
+            time.sleep(0.05)
+            exec_id = rpc.robot_call("MotionControl.getExecId")
+        if self.cancel_event.is_set():
+            raise RuntimeError(f"Aubo SDK moveJoint cancelled at {label}")
+        if exec_id != -1:
+            raise TimeoutError(f"Aubo SDK moveJoint exec timeout at {label}: exec_id={exec_id}")
+
+    def _sdk_wait_arrival(self, rpc: AuboDirectJsonRpc, target: np.ndarray, label: str) -> bool:
+        tolerance = max(float(self.get_parameter("aubo_sdk_goal_tolerance_rad").value), 0.001)
+        speed = max(float(self.get_parameter("aubo_sdk_move_speed_rad_sec").value), 0.01)
+        current = np.asarray(
+            [float(value) for value in rpc.robot_call("RobotState.getJointPositions")],
+            dtype=float,
+        )
+        max_delta = float(np.max(np.abs(self._joint_delta(target, current))))
+        timeout = max(max_delta / speed, 0.5) + max(
+            float(self.get_parameter("aubo_sdk_arrival_timeout_padding_sec").value), 0.0
+        )
+        deadline = time.monotonic() + timeout
+        stable_since: float | None = None
+        stable_required = 0.25
+        last_error = max_delta
+        while not self.cancel_event.is_set() and time.monotonic() < deadline:
+            current = np.asarray(
+                [float(value) for value in rpc.robot_call("RobotState.getJointPositions")],
+                dtype=float,
+            )
+            last_error = float(np.max(np.abs(self._joint_delta(target, current))))
+            if last_error <= tolerance:
+                now = time.monotonic()
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= stable_required:
+                    self._status(f"Aubo SDK moveJoint reached: {label}")
+                    return True
+            else:
+                stable_since = None
+            time.sleep(0.05)
+        self._status(
+            f"Aubo SDK moveJoint arrival timeout at {label}: "
+            f"max_error={last_error:.3f}rad tolerance={tolerance:.3f}rad",
+            warn=True,
+        )
+        return False
+
+    def _joint_delta(self, target: np.ndarray, current: np.ndarray) -> np.ndarray:
+        return np.asarray(
+            [
+                _angle_diff(float(target_value), float(current_value))
+                for target_value, current_value in zip(target, current)
+            ],
+            dtype=float,
+        )
+
+    def _send_arm_replay_segment(
+        self, start: list[float], target: list[float], label: str
+    ) -> bool:
+        if len(target) != len(self.arm_command_joint_names):
+            self._status(f"arm replay skipped: invalid joint target length for {label}", warn=True)
+            return False
+        if len(start) != len(target):
+            self._status(f"arm replay skipped: invalid segment start length for {label}", warn=True)
+            return False
+
+        violation = self._arm_keepout_violation(target, label)
+        if violation is not None:
+            self._status(f"arm replay blocked by safety zone: {violation}", warn=True)
+            return False
+
+        duration = self._arm_replay_segment_duration(start, target)
+        nominal_velocities, nominal_accelerations = self._arm_replay_segment_derivatives(
+            start, target, duration
+        )
+        peak_speed = max((abs(value) for value in nominal_velocities), default=0.0)
+        peak_accel = max((abs(value) for value in nominal_accelerations), default=0.0)
+        self._status(
+            f"arm replay segment: {label} t={duration:.2f}s "
+            f"speed={peak_speed:.3f} accel={peak_accel:.3f}"
+        )
+        start_array = np.array([float(value) for value in start], dtype=float)
+        target_array = np.array([float(value) for value in target], dtype=float)
+        delta = np.array(
+            [
+                _angle_diff(float(target_value), float(start_value))
+                for start_value, target_value in zip(start_array, target_array)
+            ],
+            dtype=float,
+        )
+        tolerance = max(float(self.get_parameter("arm_goal_tolerance").value), 0.005)
+        rate = max(float(self.get_parameter("arm_velocity_publish_rate").value), 1.0)
+        period = 1.0 / rate
+        gain = 1.1
+        deadline = time.monotonic() + max(duration + 8.0, 4.0)
+        started = time.monotonic()
+        stable_since: float | None = None
+        stable_required = 0.25
+
+        try:
+            while not self.cancel_event.is_set() and time.monotonic() < deadline:
+                now = time.monotonic()
+                current = self._current_arm_vector()
+                if current is None or len(current) != len(target):
+                    self._status(f"arm replay skipped: no joint state for {label}", warn=True)
+                    return False
+                current_array = np.array([float(value) for value in current], dtype=float)
+                elapsed = max(0.0, now - started)
+                u = min(elapsed / max(duration, 1e-3), 1.0)
+                smooth_u = (3.0 * u * u) - (2.0 * u * u * u)
+                smooth_du = (6.0 * u * (1.0 - u)) / max(duration, 1e-3)
+                desired = start_array + delta * smooth_u
+                feedforward = delta * smooth_du
+                position_error = np.array(
+                    [
+                        _angle_diff(float(desired_value), float(current_value))
+                        for desired_value, current_value in zip(desired, current_array)
+                    ],
+                    dtype=float,
+                )
+                velocity = feedforward + position_error * gain
+                final_error = np.array(
+                    [
+                        _angle_diff(float(target_value), float(current_value))
+                        for target_value, current_value in zip(target_array, current_array)
+                    ],
+                    dtype=float,
+                )
+                if float(np.max(np.abs(final_error))) <= tolerance:
+                    if stable_since is None:
+                        stable_since = now
+                    if now - stable_since >= stable_required:
+                        self._status(f"arm replay reached: {label}")
+                        return True
+                else:
+                    stable_since = None
+                self._set_manual_arm_velocity([float(value) for value in velocity], label)
+                time.sleep(period)
+            self._status(f"arm replay timeout/cancel: {label}", warn=True)
+            return False
+        finally:
+            self.stop_arm_velocity_hold()
+
+    def _arm_replay_segment_duration(self, start: list[float], target: list[float]) -> float:
+        duration = max(float(self.get_parameter("arm_waypoint_duration_sec").value), 0.2)
+        deltas = [abs(_angle_diff(float(t), float(s))) for s, t in zip(start, target)]
+        max_delta = max(deltas, default=0.0)
+        max_speed = max(float(self.get_parameter("arm_velocity_max_joint_speed_rad_sec").value), 0.01)
+        max_accel = max(float(self.get_parameter("arm_velocity_max_joint_accel_rad_sec2").value), 0.01)
+        duration = max(duration, max_delta / max_speed)
+        duration = max(duration, math.sqrt(max_delta / max_accel) if max_delta > 0.0 else duration)
+        return duration
+
+    def _arm_replay_segment_derivatives(
+        self, start: list[float], target: list[float], duration: float
+    ) -> tuple[list[float], list[float]]:
+        safe_duration = max(float(duration), 1e-3)
+        velocities = [
+            _angle_diff(float(target_value), float(start_value)) / safe_duration
+            for start_value, target_value in zip(start, target)
+        ]
+        accelerations = [value / safe_duration for value in velocities]
+        return velocities, accelerations
+
     def _wait_for_arm_target(
         self, target: list[float], tolerance: float, timeout_sec: float
     ) -> bool:
         deadline = time.monotonic() + max(timeout_sec, 0.0)
         best_error = float("inf")
+        stable_since: float | None = None
+        stable_required = 0.25
         while time.monotonic() < deadline and not self.cancel_event.is_set():
             current = self._current_arm_vector()
             if current is not None and len(current) == len(target):
                 error = max(abs(a - b) for a, b in zip(current, target))
                 best_error = min(best_error, error)
                 if error <= tolerance:
-                    return True
+                    now = time.monotonic()
+                    if stable_since is None:
+                        stable_since = now
+                    if now - stable_since >= stable_required:
+                        return True
+                else:
+                    stable_since = None
             time.sleep(0.05)
         self.get_logger().warning(f"arm target feedback timeout: best_error={best_error:.4f}")
         return False
@@ -1833,6 +2822,162 @@ class TeachPanelNode(Node):
 
     def _start_worker(self, target) -> None:
         threading.Thread(target=target, daemon=True).start()
+
+    def _managed_process_status_locked(self, name: str) -> str:
+        process = self.managed_processes.get(name)
+        if process is None:
+            return "stopped"
+        result = process.poll()
+        if result is None:
+            return f"running pid={process.pid}"
+        return f"exited {result}"
+
+    def start_managed_process(self, name: str) -> None:
+        if name not in MANAGED_SERVICE_COMMAND_PARAMS:
+            self._status(f"service start ignored unknown service: {name}", warn=True)
+            return
+        self._start_worker(lambda: self._start_managed_process_worker(name))
+
+    def start_camera_stack(self) -> None:
+        self.start_managed_process("camera")
+
+        def delayed_viewer() -> None:
+            time.sleep(0.8)
+            self.start_managed_process("viewer")
+
+        self._start_worker(delayed_viewer)
+
+    def stop_managed_process(self, name: str) -> None:
+        if name not in MANAGED_SERVICE_COMMAND_PARAMS:
+            self._status(f"service stop ignored unknown service: {name}", warn=True)
+            return
+        self._start_worker(lambda: self._stop_managed_process_worker(name))
+
+    def toggle_managed_process(self, name: str) -> None:
+        with self.lock:
+            process = self.managed_processes.get(name)
+            running = process is not None and process.poll() is None
+        if running:
+            self.stop_managed_process(name)
+        else:
+            self.start_managed_process(name)
+
+    def stop_all_managed_processes(self) -> None:
+        for name in list(MANAGED_SERVICE_COMMAND_PARAMS):
+            self._stop_managed_process_worker(name, quiet=True)
+
+    def _start_managed_process_worker(self, name: str) -> None:
+        command_param = MANAGED_SERVICE_COMMAND_PARAMS[name]
+        command = str(self.get_parameter(command_param).value).strip()
+        if not command:
+            self._status(f"service {name} has empty command", warn=True)
+            return
+        already_message = ""
+        with self.lock:
+            existing = self.managed_processes.get(name)
+            if existing is not None and existing.poll() is None:
+                already_message = f"service {name} already running pid={existing.pid}"
+        if already_message:
+            self._status(already_message)
+            return
+
+        log_path = self.runtime_log_dir / f"{name}.log"
+        shell_command = "\n".join(
+            [
+                "set -euo pipefail",
+                f"cd {shlex.quote(str(self.workspace_root))}",
+                "set +u",
+                "source scripts/env/arachne_env.sh",
+                "[[ -f install/setup.bash ]] && source install/setup.bash",
+                "[[ -f scripts/env/arachne_real_defaults.sh ]] && source scripts/env/arachne_real_defaults.sh",
+                "set -u",
+                f"exec {command}",
+            ]
+        )
+        try:
+            handle = log_path.open("a", encoding="utf-8")
+            handle.write(
+                f"\n[{datetime.now().isoformat(timespec='seconds')}] start {name}: {command}\n"
+            )
+            handle.flush()
+            process = subprocess.Popen(
+                ["bash", "-lc", shell_command],
+                cwd=str(self.workspace_root),
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+            )
+        except Exception as exc:
+            try:
+                handle.close()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+            self._status(f"service {name} start failed: {exc}", warn=True)
+            return
+
+        with self.lock:
+            old_handle = self.managed_process_log_handles.pop(name, None)
+            if old_handle is not None:
+                try:
+                    old_handle.close()
+                except OSError:
+                    pass
+            self.managed_processes[name] = process
+            self.managed_process_logs[name] = log_path
+            self.managed_process_log_handles[name] = handle
+            self.hardware_status[f"Svc:{name}"] = f"running pid={process.pid}"
+        self._write_event(
+            "service_start",
+            f"{name} running pid={process.pid}",
+            service=name,
+            command=command,
+            log=str(log_path),
+            pid=process.pid,
+        )
+        self._status(f"service {name} started pid={process.pid}; log={log_path}")
+
+    def _stop_managed_process_worker(self, name: str, *, quiet: bool = False) -> None:
+        timeout_sec = max(float(self.get_parameter("service_stop_timeout_sec").value), 0.5)
+        with self.lock:
+            process = self.managed_processes.get(name)
+        if process is None:
+            if not quiet:
+                self._status(f"service {name} already stopped")
+            return
+
+        result = process.poll()
+        if result is None:
+            if not quiet:
+                self._status(f"service {name} stopping pid={process.pid}")
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+                process.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=2.0)
+                except Exception as exc:
+                    if not quiet:
+                        self._status(f"service {name} terminate failed: {exc}", warn=True)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                if not quiet:
+                    self._status(f"service {name} stop failed: {exc}", warn=True)
+        result = process.poll()
+        with self.lock:
+            self.managed_processes.pop(name, None)
+            self.hardware_status[f"Svc:{name}"] = f"stopped ({result})"
+            handle = self.managed_process_log_handles.pop(name, None)
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        self._write_event("service_stop", f"{name} stopped result={result}", service=name)
+        if not quiet:
+            self._status(f"service {name} stopped result={result}")
 
     def _start_manual_arm_worker(self, target) -> None:
         def runner() -> None:
@@ -1918,7 +3063,7 @@ class TeachPanelNode(Node):
         tool_transform = arm_base @ link_transforms[-1][1]
         tool_points = {
             "tool0": (0.0, 0.0, 0.0),
-            "grasp_frame": (0.0, 0.0, 0.165),
+            "grasp_frame": (0.0, 0.0, 0.138691938),
             "tool_envelope_x+": (0.070, 0.0, 0.090),
             "tool_envelope_x-": (-0.070, 0.0, 0.090),
             "tool_envelope_y+": (0.0, 0.070, 0.090),
@@ -1941,6 +3086,7 @@ class TeachPanelNode(Node):
         arm_joint_step_deg: float,
         arm_hold_period_sec: float,
         waypoint_duration_sec: float,
+        gripper_settle_sec: float,
         arm_home_joints_deg: str,
         arm_install_joints_deg: str,
     ) -> None:
@@ -1954,6 +3100,8 @@ class TeachPanelNode(Node):
             raise ValueError("hold period must be positive")
         if waypoint_duration_sec <= 0.0:
             raise ValueError("waypoint duration must be positive")
+        if gripper_settle_sec < 0.0:
+            raise ValueError("gripper settle must be non-negative")
         home_values = _parse_joint_degrees(arm_home_joints_deg, label="home joints")
         install_values = _parse_joint_degrees(arm_install_joints_deg, label="install joints")
         self.set_parameters(
@@ -1982,6 +3130,11 @@ class TeachPanelNode(Node):
                     float(waypoint_duration_sec),
                 ),
                 Parameter(
+                    "gripper_settle_sec",
+                    Parameter.Type.DOUBLE,
+                    float(gripper_settle_sec),
+                ),
+                Parameter(
                     "arm_home_joints_deg",
                     Parameter.Type.STRING,
                     _format_joint_degrees(home_values),
@@ -1997,7 +3150,8 @@ class TeachPanelNode(Node):
             "motion settings applied: "
             f"base={base_linear_speed:.3f}m/s {base_angular_speed:.3f}rad/s, "
             f"tcp={arm_jog_step_m:.3f}m, rot={arm_rotate_step_deg:.1f}deg, "
-            f"joint={arm_joint_step_deg:.1f}deg, hold={arm_hold_period_sec:.2f}s"
+            f"joint={arm_joint_step_deg:.1f}deg, hold={arm_hold_period_sec:.2f}s, "
+            f"gripper_settle={gripper_settle_sec:.1f}s"
         )
 
     def _status(self, text: str, *, warn: bool = False) -> None:
@@ -2006,6 +3160,7 @@ class TeachPanelNode(Node):
             self.last_status = text
             self.log_lines.append(f"{stamp} {'WARN' if warn else 'INFO'} {text}")
             self.log_lines = self.log_lines[-300:]
+        self._write_event("status", text, level="warn" if warn else "info")
         msg = String()
         msg.data = text
         self.status_pub.publish(msg)
@@ -2045,6 +3200,9 @@ class TeachPanelApp:
         self.waypoint_duration_var = tk.StringVar(
             value=f"{float(node.get_parameter('arm_waypoint_duration_sec').value):.2f}"
         )
+        self.gripper_settle_var = tk.StringVar(
+            value=f"{float(node.get_parameter('gripper_settle_sec').value):.1f}"
+        )
         self.home_joints_var = tk.StringVar(
             value=str(node.get_parameter("arm_home_joints_deg").value)
         )
@@ -2065,6 +3223,7 @@ class TeachPanelApp:
         self._arm_hold_stream_active = False
         self._preset_hold_after: str | None = None
         self._preset_hold_active = False
+        self.program_record_buttons: list[ttk.Button] = []
         self.listbox: tk.Listbox | None = None
         self.log_text: tk.Text | None = None
         self.joint_tree: ttk.Treeview | None = None
@@ -2144,11 +3303,11 @@ class TeachPanelApp:
     def _build_top_bar(self) -> None:
         top = ttk.Frame(self.root, style="Top.TFrame", padding=(12, 8))
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(4, weight=1)
+        top.columnconfigure(5, weight=1)
         ttk.Label(top, text="Arachne Scope", style="TopTitle.TLabel").grid(
             row=0, column=0, rowspan=2, sticky="w", padx=(0, 18)
         )
-        for column, key in enumerate(("Aubo", "Base", "Gripper"), start=1):
+        for column, key in enumerate(("Aubo", "Base", "Gripper", "Grasp"), start=1):
             var = tk.StringVar(value="waiting")
             self.status_vars[key] = var
             ttk.Label(top, text=key, style="Top.TLabel").grid(row=0, column=column, sticky="w", padx=8)
@@ -2158,16 +3317,50 @@ class TeachPanelApp:
         status_var = tk.StringVar(value="ready")
         self.status_vars["status"] = status_var
         ttk.Label(top, textvariable=status_var, style="Top.TLabel").grid(
-            row=0, column=4, rowspan=2, sticky="ew", padx=(16, 8)
+            row=0, column=5, rowspan=2, sticky="ew", padx=(16, 8)
         )
-        self._make_preset_hold_button(top, "Home", "home").grid(row=0, column=5, rowspan=2, padx=4)
+        self._make_preset_hold_button(top, "Home", "home").grid(row=0, column=6, rowspan=2, padx=4)
         self._make_preset_hold_button(top, "Install", "install").grid(
-            row=0, column=6, rowspan=2, padx=4
+            row=0, column=7, rowspan=2, padx=4
         )
-        ttk.Button(top, text="Run", command=self._play).grid(row=0, column=7, rowspan=2, padx=4)
+        ttk.Button(top, text="Run", command=self._play).grid(row=0, column=8, rowspan=2, padx=4)
+        self.program_record_button = ttk.Button(
+            top, text="Program Rec Off", command=self._toggle_program_recording
+        )
+        self.program_record_buttons.append(self.program_record_button)
+        self.program_record_button.grid(row=0, column=9, rowspan=2, padx=4)
         ttk.Button(top, text="Stop", command=self.node.stop_all, style="Danger.TButton").grid(
-            row=0, column=8, rowspan=2, padx=4
+            row=0, column=10, rowspan=2, padx=4
         )
+        ttk.Button(top, text="Visual Grasp", command=self.node.visual_grasp_start).grid(
+            row=0, column=11, rowspan=2, padx=4
+        )
+        ttk.Button(
+            top,
+            text="G Stop",
+            command=lambda: self.node.call_grasp_task("stop"),
+            style="Danger.TButton",
+        ).grid(row=0, column=12, rowspan=2, padx=4)
+        ttk.Button(top, text="Restore", command=lambda: self.node.call_grasp_task("restore")).grid(
+            row=0, column=13, rowspan=2, padx=4
+        )
+        ttk.Button(top, text="Aubo On", command=lambda: self.node.command_aubo_lifecycle("power_on")).grid(
+            row=0, column=14, rowspan=2, padx=4
+        )
+        ttk.Button(top, text="Aubo Start", command=lambda: self.node.command_aubo_lifecycle("startup")).grid(
+            row=0, column=15, rowspan=2, padx=4
+        )
+        ttk.Button(top, text="Aubo Off", command=self._confirm_aubo_power_off, style="Danger.TButton").grid(
+            row=0, column=16, rowspan=2, padx=4
+        )
+
+    def _confirm_aubo_power_off(self) -> None:
+        if not messagebox.askyesno(
+            "Aubo Power Off",
+            "Power off the real Aubo arm now?\n\nConfirm the arm is supported and the workspace is safe.",
+        ):
+            return
+        self.node.command_aubo_lifecycle("power_off")
 
     def _build_home_tab(self) -> None:
         tab = self._add_scrollable_tab("Home")
@@ -2178,7 +3371,22 @@ class TeachPanelApp:
         overview = ttk.LabelFrame(tab, text="Robot Status")
         overview.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
         overview.columnconfigure(1, weight=1)
-        for row, key in enumerate(("base", "tool", "arm", "gripper", "teach", "program")):
+        for row, key in enumerate(
+            (
+                "base",
+                "tool",
+                "arm",
+                "gripper",
+                "teach",
+                "grasp_task",
+                "camera",
+                "viewer",
+                "slam",
+                "grasp_server",
+                "program",
+                "log_dir",
+            )
+        ):
             ttk.Label(overview, text=key, style="State.TLabel", width=10).grid(
                 row=row, column=0, sticky="w", padx=6, pady=4
             )
@@ -2198,22 +3406,70 @@ class TeachPanelApp:
             row=0, column=2, sticky="ew", padx=5, pady=5
         )
         buttons = (
+            ("Aubo On", lambda: self.node.command_aubo_lifecycle("power_on")),
+            ("Aubo Start", lambda: self.node.command_aubo_lifecycle("startup")),
+            ("Aubo Off", self._confirm_aubo_power_off),
             ("Teach On", lambda: self.node.set_aubo_teach(True)),
             ("Teach Off", lambda: self.node.set_aubo_teach(False)),
             ("Set Home", self._set_home_from_current),
             ("Set Install", self._set_install_from_current),
+            ("Program Rec", self._toggle_program_recording),
             ("Record", self._record),
             ("Replay", self._play),
+            ("Visual Grasp", self.node.visual_grasp_start),
+            ("Grasp Start", lambda: self.node.call_grasp_task("start")),
+            ("Grasp Stop", lambda: self.node.call_grasp_task("stop")),
+            ("Restore", lambda: self.node.call_grasp_task("restore")),
+            ("Camera", self.node.start_camera_stack),
+            ("2D View", lambda: self.node.toggle_managed_process("viewer")),
+            ("SLAM", lambda: self.node.toggle_managed_process("slam")),
+            ("GraspSrv", lambda: self.node.toggle_managed_process("grasp_server")),
             ("Open", lambda: self.node.publish_gripper("open")),
             ("Close", lambda: self.node.publish_gripper("close")),
             ("Save Config", self._save_config),
         )
         for index, (text, command) in enumerate(buttons, start=3):
-            ttk.Button(quick, text=text, command=command).grid(
+            button = ttk.Button(quick, text=text, command=command)
+            if text == "Program Rec":
+                self.program_record_buttons.append(button)
+            button.grid(
                 row=index // 3, column=index % 3, sticky="ew", padx=5, pady=5
             )
         for column in range(3):
             quick.columnconfigure(column, weight=1)
+
+        services = ttk.LabelFrame(tab, text="Runtime Services")
+        services.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        services.columnconfigure(1, weight=1)
+        for row, (key, label) in enumerate(
+            (
+                ("camera", "Gemini Camera"),
+                ("viewer", "2D Raw View"),
+                ("slam", "SLAM / Nav"),
+                ("grasp_server", "Grasp Server"),
+            )
+        ):
+            ttk.Label(services, text=label, style="State.TLabel", width=16).grid(
+                row=row, column=0, sticky="w", padx=6, pady=4
+            )
+            var = self.status_vars.get(key)
+            if var is None:
+                var = tk.StringVar(value="stopped")
+                self.status_vars[key] = var
+            ttk.Label(services, textvariable=var).grid(
+                row=row, column=1, sticky="ew", padx=6, pady=4
+            )
+            ttk.Button(
+                services,
+                text="Start",
+                command=lambda name=key: self.node.start_managed_process(name),
+            ).grid(row=row, column=2, sticky="ew", padx=4, pady=4)
+            ttk.Button(
+                services,
+                text="Stop",
+                command=lambda name=key: self.node.stop_managed_process(name),
+                style="Danger.TButton",
+            ).grid(row=row, column=3, sticky="ew", padx=4, pady=4)
 
         joints = ttk.LabelFrame(tab, text="Monitor and Joint")
         joints.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
@@ -2330,6 +3586,7 @@ class TeachPanelApp:
             ("Joint step deg", self.arm_joint_step_var),
             ("Hold period s", self.arm_hold_period_var),
             ("Waypoint duration s", self.waypoint_duration_var),
+            ("Gripper settle s", self.gripper_settle_var),
         )
         for row, (label, var) in enumerate(fields):
             ttk.Label(motion, text=label, width=20).grid(row=row, column=0, sticky="w", padx=6, pady=5)
@@ -2446,6 +3703,11 @@ class TeachPanelApp:
             else:
                 button.bind("<ButtonPress-1>", lambda _event, d=direction: self._base_press(d))
                 button.bind("<ButtonRelease-1>", lambda _event: self._base_release())
+        base_rec_button = ttk.Button(
+            frame, text="Program Rec Off", command=self._toggle_program_recording
+        )
+        base_rec_button.grid(row=3, column=0, columnspan=3, padx=4, pady=(8, 4), sticky="ew")
+        self.program_record_buttons.append(base_rec_button)
 
     def _build_arm_controls(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Aubo Move / HandGuide")
@@ -2473,6 +3735,15 @@ class TeachPanelApp:
         )
         ttk.Button(frame, text="Teach Off", command=lambda: self.node.set_aubo_teach(False)).grid(
             row=6, column=2, padx=4, pady=(8, 4), sticky="ew"
+        )
+        ttk.Button(frame, text="Power On", command=lambda: self.node.command_aubo_lifecycle("power_on")).grid(
+            row=7, column=0, padx=4, pady=4, sticky="ew"
+        )
+        ttk.Button(frame, text="Startup", command=lambda: self.node.command_aubo_lifecycle("startup")).grid(
+            row=7, column=1, padx=4, pady=4, sticky="ew"
+        )
+        ttk.Button(frame, text="Power Off", command=self._confirm_aubo_power_off, style="Danger.TButton").grid(
+            row=7, column=2, padx=4, pady=4, sticky="ew"
         )
 
     def _build_joint_target_controls(self, parent: ttk.Frame) -> None:
@@ -2560,11 +3831,14 @@ class TeachPanelApp:
 
     def _refresh(self) -> None:
         snapshot = self.node.snapshot()
-        snapshot["program"] = f"{len(self.waypoints)} nodes"
+        rec_enabled, pending_base = self.node.base_motion_recording_state()
+        rec_label = "rec on" if rec_enabled else "rec off"
+        snapshot["program"] = f"{len(self.waypoints)} nodes | {rec_label} | base pending={pending_base}"
         for key, var in self.status_vars.items():
             var.set(snapshot.get(key, "waiting"))
         for key, var in self.move_status_vars.items():
             var.set(snapshot.get(key, "waiting"))
+        self._update_program_record_button()
         self._refresh_move_joint_values()
         self._refresh_joint_tree()
         self._refresh_logs()
@@ -2622,6 +3896,7 @@ class TeachPanelApp:
                 arm_joint_step_deg=float(self.arm_joint_step_var.get()),
                 arm_hold_period_sec=float(self.arm_hold_period_var.get()),
                 waypoint_duration_sec=float(self.waypoint_duration_var.get()),
+                gripper_settle_sec=float(self.gripper_settle_var.get()),
                 arm_home_joints_deg=self.home_joints_var.get(),
                 arm_install_joints_deg=self.install_joints_var.get(),
             )
@@ -2738,6 +4013,9 @@ class TeachPanelApp:
         self.waypoint_duration_var.set(
             f"{float(self.node.get_parameter('arm_waypoint_duration_sec').value):.2f}"
         )
+        self.gripper_settle_var.set(
+            f"{float(self.node.get_parameter('gripper_settle_sec').value):.1f}"
+        )
         self.home_joints_var.set(str(self.node.get_parameter("arm_home_joints_deg").value))
         self.install_joints_var.set(str(self.node.get_parameter("arm_install_joints_deg").value))
         self.config_path_var.set(str(self.node.get_parameter("teach_config_path").value))
@@ -2804,8 +4082,21 @@ class TeachPanelApp:
 
     def _base_release(self) -> None:
         self.node.drive_base_manual("stop")
-        if self.node.pending_base_motion_count() > 0:
-            self._record()
+
+    def _toggle_program_recording(self) -> None:
+        enabled, _pending = self.node.base_motion_recording_state()
+        self.node.set_base_motion_recording(not enabled)
+        self._update_program_record_button()
+
+    def _update_program_record_button(self) -> None:
+        if not hasattr(self, "program_record_buttons"):
+            return
+        enabled, pending = self.node.base_motion_recording_state()
+        text = f"Program Rec {'On' if enabled else 'Off'}"
+        if pending:
+            text += f" ({pending})"
+        for button in self.program_record_buttons:
+            button.configure(text=text)
 
     def _record(self) -> None:
         try:
@@ -2980,6 +4271,7 @@ def main() -> None:
         TeachPanelApp(node).run()
     finally:
         node.stop_all()
+        node.stop_all_managed_processes()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

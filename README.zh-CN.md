@@ -14,12 +14,9 @@ Arachne 是一个面向深度强化学习联合控制的移动操作机器人 RO
 
 项目最终目标是形成一台能在真实场景中执行精密装配、测量和移动操作任务的联合控制小车：底盘、机械臂、夹具和视觉/雷达传感器共享状态表示，在安全约束内由传统控制、示教数据、视觉感知和深度强化学习策略逐步融合。当前 `jetson` 路线优先打牢真机流式控制、感知数据采集、可视化示教、数字孪生和边缘推理链路；早期任务线包括垃圾识别拾取入篮，以及充电枪识别、对准、拔出和插入。
 
-<table>
-  <tr>
-    <td width="50%" align="center"><img src="docs/demo/realbot_1.jpg" alt="Arachne physical robot front view" width="100%"></td>
-    <td width="50%" align="center"><img src="docs/demo/realbot_2.jpg" alt="Arachne physical robot side view" width="100%"></td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/demo/realbot.PNG" alt="Arachne 真机硬件介绍图" width="900">
+</p>
 
 ## 特性
 
@@ -72,8 +69,13 @@ source install/setup.bash
 | Gazebo 自主拾取验证 | `./scripts/sim/gazebo_autopick_demo.sh` |
 | Godot 展示前端 | `./scripts/godot/godot_showcase.sh` |
 | Gemini335 YOLO 实时标注 | `./scripts/vision/gemini_yolo_live.sh` |
-| Bottle 抓取入篮路径预览 | `./scripts/vision/grasp_preview.sh` |
+| C16 雷达驱动 | `ros2 launch lslidar_driver lslidar_cx_launch.py` |
+| C16 + 整车融合 RViz | `rviz2 -d src/arachne_description/rviz/arachne_lidar_fusion.rviz` |
+| Trash 分割抓取入篮预览 | `./scripts/vision/grasp_preview.sh` |
 | 真机姿态同步抓取预览 | `./scripts/vision/grasp_preview_real_sync.sh` |
+| 真机同步并执行抓取 | `ARACHNE_CONFIRM_GRASP_EXECUTE_REAL=YES ./scripts/vision/grasp_preview_real_sync.sh --execute-real` |
+| 抓取任务服务器 | `./scripts/vision/grasp_task_server.sh` |
+| Agent Bridge | `./scripts/agent/agent_bridge.sh` |
 | 真机环境检查 | `./scripts/hardware/check_real_hardware_env.sh` |
 | 真机一键 bringup | `./scripts/hardware/real_bringup.sh` |
 | 真机示教演示 | `./scripts/hardware/real_teach_demo.sh` |
@@ -98,8 +100,8 @@ Arachne 的真机层尽量复用官方或厂家 ROS 路线，并在本仓库内�
 | Scout 2.0 | `scout_waveshare_serial_driver` | `/cmd_vel` 到 Scout v2 CAN 帧；Waveshare USB-CAN-A，CH340 串口，默认 `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0` |
 | MS42DC | `ms42dc_direct_serial_driver` | `/arachne/gripper/command` 到 Type-C 串口帧；夹具控制板为 CH91xx/CH343 系列，当前实机按 CH9012 路线处理，推荐别名 `/dev/motor_serial` |
 | Aubo i5 | `AuboRobot/aubo_ros2_driver` | TCP/IP + ros2_control，按机器人 IP 启动 |
-| Gemini335 | `arachne_sensors` | 末端 RGB-D 相机，用于目标检测、深度 ROI、抓取位姿估计和示教观测 |
-| 镭神智能 C16 | `arachne_description` / 后续雷达驱动 | 后置架雷达模型已纳入 TF 树，后续用于障碍感知、定位辅助和移动操作安全约束 |
+| Gemini335 | `arachne_sensors` | 末端 RGB-D 相机，用于目标分割、mask/depth ROI、抓取位姿估计和示教观测 |
+| 镭神智能 C16 | `third_party/Lslidar_ROS2_driver_C16_V4` + `arachne_description` | 官方 C16_V4 驱动，UDP `2368/2369`，默认设备 IP `192.168.1.200`；点云发布到 `/lslidar_point_cloud`，frame 为 `lidar_link`，融合 RViz 使用 `lidar_link` 作为固定坐标，当前 `distance_unit=0.4` |
 
 准备真机相关 ROS 包：
 
@@ -159,16 +161,18 @@ ARACHNE_CONFIRM_REAL_MOTION=YES ./scripts/hardware/real_hardware_acceptance_test
 | 路径 | 内容 |
 | --- | --- |
 | `src/arachne_description` | 统一机器人模型、RViz 配置、夹爪变体和传感器坐标系 |
-| `src/arachne_sensors` | Gemini335 RGB-D 相机节点、C16 雷达接入预留和传感器 launch |
+| `src/arachne_sensors` | Gemini335 RGB-D 相机节点和传感器 launch |
+| `third_party/Lslidar_ROS2_driver_C16_V4` | 镭神官方 C16_V4 ROS2 驱动，按 `lidar_link`、`/lslidar_point_cloud`、`distance_unit=0.4` 接入 |
 | `src/arachne_demo` | Switch Pro 手柄、Gazebo 展厅、自主拾取验证 |
 | `src/arachne_hardware` | 真机 bringup、Scout/MS42DC wrapper、安全状态和命令门控 |
 | `src/arachne_control` | ros2_control 控制器命名、mock 控制器和硬件 profile |
 | `src/arachne_moveit_config` | Aubo i5 + MS42DC/AG95 的 MoveIt2 起步配置 |
 | `src/arachne_nav` | Scout Nav2 起步配置 |
-| `src/arachne_operator` | 操作员面板、sequence executor、VLA/WAM action chunk translator |
+| `src/arachne_operator` | 操作员面板、grasp task server、sequence executor、VLA/WAM action chunk translator |
+| `src/arachne_agent_bridge` | 外部 Agent 的安全工具白名单、示教式控制桥和状态快照 |
 | `scripts/env` / `scripts/build` | ROS 环境和 colcon 构建入口 |
 | `scripts/hardware` / `scripts/operator` | 真机 bringup、验收、Aubo 辅助脚本和示教入口 |
-| `scripts/vision` | Gemini335、YOLO26、TensorRT、INT8 校准和实时检测入口 |
+| `scripts/vision` | Gemini335、YOLO26 segmentation、TensorRT、INT8 校准和实时分割入口 |
 | `scripts/model` / `scripts/sim` / `scripts/godot` | 模型检查、仿真演示和 Godot 展示脚本 |
 | `yolo_workspace` | YOLO 专用 venv、权重、engine、数据集和校准图片目录 |
 | `godot/arachne_showcase` | Godot 4.x 第三人称展示前端 |
@@ -182,6 +186,9 @@ ARACHNE_CONFIRM_REAL_MOTION=YES ./scripts/hardware/real_hardware_acceptance_test
 - [控制](docs/control.zh-CN.md)
 - [硬件](docs/hardware.zh-CN.md)
 - [标定](docs/calibration.zh-CN.md)
+- [抓取任务服务器](docs/grasp_task_server.zh-CN.md)
+- [Agent Bridge](docs/agent_platform.zh-CN.md)
+- [任务路线：垃圾拾取与充电枪拔插](docs/task_tracks.zh-CN.md)
 - [参考资料](docs/references.zh-CN.md)
 
 英文版本位于同名文档，例如 [docs/hardware.md](docs/hardware.md)。
@@ -189,7 +196,7 @@ ARACHNE_CONFIRM_REAL_MOTION=YES ./scripts/hardware/real_hardware_acceptance_test
 ## Roadmap
 
 - **真机可靠性层**：继续稳定 Scout、Aubo、MS42DC、Gemini335 和镭神智能 C16 的一键 bringup、远程上电、载荷配置、流式速度控制和安全停止。
-- **感知与数据层**：采集 Gemini335 RGB-D 与 C16 雷达数据，微调 YOLO26 垃圾/工件/充电枪检测模型，建立 INT8 TensorRT 推理、深度 ROI 定位和本地数据集闭环。
+- **感知与任务层**：采集 Gemini335 RGB-D 与 C16 雷达数据，微调 YOLO26 垃圾/工件/充电枪分割模型，建立 INT8 TensorRT、mask/depth ROI 定位、抓取任务服务器和本地数据集闭环。
 - **静态操作任务**：在底盘静止时并行推进两条任务线：垃圾识别、抓取、放入车头吊篮；充电枪识别、精密对准、拔出和插入。随后扩展到工件识别、测量点定位和简单装配位姿生成。
 - **移动操作任务**：将底盘定位、机械臂可达性、车体姿态、视觉观测和 C16 环境信息统一到任务状态，做移动后停车、观察、抓取、充电枪拔插和测量的闭环流程。
 - **深度强化学习联合控制**：在仿真和真实示教数据上训练底盘-机械臂-夹具联合策略，优先覆盖精密对位、充电枪拔插、装配和测量任务，再逐步迁移到真机。

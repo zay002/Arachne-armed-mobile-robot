@@ -12,7 +12,7 @@ from launch_ros.actions import Node
 def launch_setup(context, *args, **kwargs):
     description_share = Path(get_package_share_directory("arachne_description"))
     model_path = description_share / "urdf" / "arachne.urdf.xacro"
-    rviz_config = description_share / "rviz" / "arachne_model.rviz"
+    rviz_config = Path(LaunchConfiguration("rviz_config").perform(context))
     generated_urdf = Path("/tmp/arachne_display.urdf")
 
     mappings = {
@@ -49,7 +49,13 @@ def launch_setup(context, *args, **kwargs):
             executable="robot_state_publisher",
             name="arachne_teach_robot_state_publisher",
             parameters=[{"robot_description": robot_description}],
-            remappings=[("joint_states", visualization_joint_states)],
+            remappings=[
+                ("joint_states", visualization_joint_states),
+                (
+                    "robot_description",
+                    LaunchConfiguration("display_robot_description_topic"),
+                ),
+            ],
             output="screen",
         ),
         Node(
@@ -71,7 +77,19 @@ def generate_launch_description():
                 "visualization_joint_states_topic",
                 default_value="/arachne/teach_visualization/joint_states",
             ),
+            DeclareLaunchArgument(
+                "display_robot_description_topic",
+                default_value="/arachne/display/robot_description",
+            ),
             DeclareLaunchArgument("with_rviz", default_value="true"),
+            DeclareLaunchArgument(
+                "rviz_config",
+                default_value=str(
+                    Path(get_package_share_directory("arachne_description"))
+                    / "rviz"
+                    / "arachne_lidar_fusion.rviz"
+                ),
+            ),
             DeclareLaunchArgument("arm_mount_xyz", default_value="0.22 0.0 0.155"),
             DeclareLaunchArgument("arm_mount_rpy", default_value="0.0 0.0 1.57079632679"),
             DeclareLaunchArgument("tool_adapter_xyz", default_value="0.0 0.0 0.0"),

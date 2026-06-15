@@ -14,12 +14,9 @@ Arachne is a ROS 2 workspace for a mobile manipulation robot aimed at deep-reinf
 
 The long-term goal is a real mobile manipulator that can perform precision assembly, measurement, and mobile manipulation tasks. The base, arm, gripper, vision sensors, and lidar share a common state representation, while classical control, teach data, visual perception, and deep RL policies are fused under explicit safety constraints. The current `jetson` route focuses on real-hardware streaming control, perception capture, teach-panel workflows, digital-twin validation, and edge inference. Early task tracks include trash recognition and basket placement, plus charging-gun recognition, alignment, removal, and insertion.
 
-<table>
-  <tr>
-    <td width="50%" align="center"><img src="docs/demo/realbot_1.jpg" alt="Arachne physical robot front view" width="100%"></td>
-    <td width="50%" align="center"><img src="docs/demo/realbot_2.jpg" alt="Arachne physical robot side view" width="100%"></td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/demo/realbot.PNG" alt="Arachne real hardware overview" width="900">
+</p>
 
 ## Features
 
@@ -72,9 +69,13 @@ Without that environment, RViz may fail to resolve `package://...` mesh paths, c
 | Gazebo autonomous pick validation | `./scripts/sim/gazebo_autopick_demo.sh` |
 | Godot showcase | `./scripts/godot/godot_showcase.sh` |
 | Gemini335 YOLO live preview | `./scripts/vision/gemini_yolo_live.sh` |
-| Bottle grasp-to-basket path preview | `./scripts/vision/grasp_preview.sh` |
+| C16 lidar driver | `ros2 launch lslidar_driver lslidar_cx_launch.py` |
+| C16 + robot fusion RViz | `rviz2 -d src/arachne_description/rviz/arachne_lidar_fusion.rviz` |
+| Trash segmentation grasp-to-basket preview | `./scripts/vision/grasp_preview.sh` |
 | Real-pose synchronized grasp preview | `./scripts/vision/grasp_preview_real_sync.sh` |
 | Real-pose synchronized grasp execution | `ARACHNE_CONFIRM_GRASP_EXECUTE_REAL=YES ./scripts/vision/grasp_preview_real_sync.sh --execute-real` |
+| Grasp task server | `./scripts/vision/grasp_task_server.sh` |
+| Agent Bridge | `./scripts/agent/agent_bridge.sh` |
 | Real-hardware environment check | `./scripts/hardware/check_real_hardware_env.sh` |
 | Real one-command bringup | `./scripts/hardware/real_bringup.sh` |
 | Real teach demo | `./scripts/hardware/real_teach_demo.sh` |
@@ -96,7 +97,7 @@ Arachne keeps the real-hardware layer ROS-facing and uses official or vendor rou
 
 ### Coordinate Frames
 
-Arachne follows the normal ROS mobile-base convention: `base_link` has +X toward the front of the vehicle, +Y toward the vehicle left, and +Z upward. `odom -> base_link` comes from base odometry, while `map -> odom` belongs to localization and is intentionally outside the URDF. The arm chain is mounted on the vehicle as `base_link -> arm_mount_link -> aubo_base_link -> ... -> tool0 -> gripper_adapter_link -> grasp_frame`; `aubo_base_link` is the Aubo base, `tool0` is the flange center, and `grasp_frame` is the gripper-center grasp TCP. The end-effector RGB-D camera is mounted under `tool0`; depth ROI points are first projected in the camera depth frame, then transformed into `base_link` before grasp planning. The grasp-preview correction `ARACHNE_GRASP_BASE_OFFSET` is a meter-scale `(x,y,z)` offset in `base_link`; the current measured default is `0.06,0.09,-0.10`, meaning 6 cm forward, 9 cm left, and 10 cm downward. Real grasp execution returns to the home pose from `scripts/env/arachne_real_defaults.sh` after opening over the basket by default.
+Arachne follows the normal ROS mobile-base convention: `base_link` has +X toward the front of the vehicle, +Y toward the vehicle left, and +Z upward. `odom -> base_link` comes from base odometry, while `map -> odom` belongs to localization and is intentionally outside the URDF. The arm chain is mounted on the vehicle as `base_link -> arm_mount_link -> aubo_base_link -> ... -> tool0 -> gripper_adapter_link -> grasp_frame`; `aubo_base_link` is the Aubo base, `tool0` is the flange center, and `grasp_frame` is the gripper-center grasp TCP. The end-effector RGB-D camera is mounted under `tool0`; depth ROI points are first projected in the camera depth frame, then transformed into `base_link` before grasp planning. The grasp-preview correction `ARACHNE_GRASP_BASE_OFFSET` is a meter-scale `(x,y,z)` offset in `base_link` and defaults to `0,0,0`; persistent bias should be handled by solving the real hand-eye transform with `scripts/vision/apriltag_hand_eye_calibration.sh`. Real grasp execution returns to the home pose from `scripts/env/arachne_real_defaults.sh` after opening over the basket by default.
 
 | Device | Default interface | Notes |
 | --- | --- | --- |
@@ -104,7 +105,7 @@ Arachne follows the normal ROS mobile-base convention: `base_link` has +X toward
 | MS42DC | `ms42dc_direct_serial_driver` | `/arachne/gripper/command` to Type-C serial frames. The gripper controller is CH91xx/CH343-family; the current unit is treated as the CH9012 path. Recommended alias: `/dev/motor_serial` |
 | Aubo i5 | `AuboRobot/aubo_ros2_driver` | TCP/IP + ros2_control, launched with the robot IP |
 | Gemini335 | `arachne_sensors` | End-effector RGB-D camera for detection, depth ROI, grasp-pose estimation, and teach observations |
-| Leishen Intelligence C16 | `arachne_description` / future lidar driver | Rear-rack lidar model is already in the TF tree; it is planned for obstacle sensing, localization support, and mobile-manipulation safety constraints |
+| Leishen Intelligence C16 | `third_party/Lslidar_ROS2_driver_C16_V4` + `arachne_description` | Official C16_V4 driver, UDP `2368/2369`, default device IP `192.168.1.200`; point cloud publishes on `/lslidar_point_cloud` with frame `lidar_link`; fusion RViz uses `lidar_link` as the fixed frame; current `distance_unit=0.4` |
 
 Prepare real-hardware ROS packages:
 
@@ -164,16 +165,18 @@ It starts real bringup, waits for `/odom`, `/joint_states`, the Aubo trajectory 
 | Path | Purpose |
 | --- | --- |
 | `src/arachne_description` | Unified robot model, RViz config, gripper variants, and sensor frames |
-| `src/arachne_sensors` | Gemini335 RGB-D camera nodes, reserved C16 lidar integration, and sensor launch files |
+| `src/arachne_sensors` | Gemini335 RGB-D camera nodes and sensor launch files |
+| `third_party/Lslidar_ROS2_driver_C16_V4` | Official Leishen C16_V4 ROS 2 driver, configured for `lidar_link`, `/lslidar_point_cloud`, and `distance_unit=0.4` |
 | `src/arachne_demo` | Switch Pro controller, Gazebo showroom, autonomous pick validation |
 | `src/arachne_hardware` | Real bringup, Scout/MS42DC wrappers, safety state, command gating |
 | `src/arachne_control` | ros2_control names, mock controllers, hardware profiles |
 | `src/arachne_moveit_config` | MoveIt2 starter config for Aubo i5 with MS42DC or AG95 |
 | `src/arachne_nav` | Nav2 starter config for Scout |
-| `src/arachne_operator` | Operator panel, sequence executor, VLA/WAM action-chunk translator |
+| `src/arachne_operator` | Operator panel, grasp task server, sequence executor, VLA/WAM action-chunk translator |
+| `src/arachne_agent_bridge` | Safe external-agent tool whitelist, teach-style control bridge, and state snapshot |
 | `scripts/env` / `scripts/build` | ROS environment and colcon build entrypoints |
 | `scripts/hardware` / `scripts/operator` | Real bringup, acceptance, Aubo helpers, and teach-panel entrypoints |
-| `scripts/vision` | Gemini335, YOLO26, TensorRT, INT8 calibration, and live detection entrypoints |
+| `scripts/vision` | Gemini335, YOLO26 segmentation, TensorRT, INT8 calibration, and live segmentation entrypoints |
 | `scripts/model` / `scripts/sim` / `scripts/godot` | Model checks, simulation demos, and Godot showcase scripts |
 | `yolo_workspace` | YOLO venv, weights, engines, datasets, and calibration images |
 | `godot/arachne_showcase` | Godot 4.x third-person showcase frontend |
@@ -187,6 +190,8 @@ The `scripts/` root no longer carries old top-level script entrypoints. Use the 
 - [Control](docs/control.md)
 - [Hardware](docs/hardware.md)
 - [Calibration](docs/calibration.md)
+- [Grasp Task Server](docs/grasp_task_server.md)
+- [Agent Bridge](docs/agent_platform.md)
 - [References](docs/references.md)
 
 Chinese versions are available as matching `*.zh-CN.md` files.
@@ -194,7 +199,7 @@ Chinese versions are available as matching `*.zh-CN.md` files.
 ## Roadmap
 
 - Real-hardware reliability: stabilize one-command bringup, remote startup, payload setup, streaming velocity control, and safe stop for Scout, Aubo, MS42DC, Gemini335, and Leishen Intelligence C16.
-- Perception and data: collect Gemini335 RGB-D and C16 lidar data, tune YOLO26 detection for trash, workpieces, and charging guns, and build INT8 TensorRT, depth ROI localization, and local dataset loops.
+- Perception and tasks: collect Gemini335 RGB-D and C16 lidar data, tune YOLO26 segmentation for trash, workpieces, and charging guns, and build INT8 TensorRT, mask/depth ROI localization, the grasp task server, and local dataset loops.
 - Static manipulation: with the base parked, advance two task tracks in parallel: recognize trash, pick it, and place it into the front basket; recognize the charging gun, precisely align, remove it, and insert it. Then extend to workpiece detection, measurement-point localization, and simple assembly pose generation.
 - Mobile manipulation: combine base localization, arm reachability, vehicle pose, visual observations, and C16 environment sensing for move-stop-observe-pick, charging-gun insertion/removal, and measurement workflows.
 - Deep RL joint control: train base-arm-gripper policies from simulation and real teach data, starting with precision alignment, charging-gun insertion/removal, assembly, and measurement before transferring to the real robot.
