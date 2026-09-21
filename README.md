@@ -6,6 +6,8 @@
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-orange)](https://releases.ubuntu.com/22.04/)
 
 ![Real robot](docs/demo/realbot.PNG)
+## 演示
+![机器人演示（4倍速）](./demo.gif)
 
 Arachne is a ROS 2 Humble workspace for a Scout 2.0 mobile base, Aubo i5 arm,
 MS42DC gripper, Gemini335 RGB-D camera, and C16 lidar.
