@@ -1,4 +1,4 @@
-# Arachne
+# Arachne 具臂移动机器人
 
 ![Arachne](docs/demo/arachne.png)
 
