@@ -2,15 +2,56 @@
 
 ![Arachne](docs/demo/arachne.png)
 
-[![ROS 2](https://img.shields.io/badge/ROS%202-Humble-blue)](https://docs.ros.org/en/humble/)
-[![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-orange)](https://releases.ubuntu.com/22.04/)
+[![ROS 2](https://img.shields.io/badge/ROS%202-Jazzy-blue)](https://docs.ros.org/en/jazzy/)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04-orange)](https://releases.ubuntu.com/24.04/)
 
 ![Real robot](docs/demo/realbot.PNG)
 ## 演示
 ![机器人演示（4倍速）](./demo.gif)
 
-Arachne is a ROS 2 Humble workspace for a Scout 2.0 mobile base, Aubo i5 arm,
+Arachne main is a ROS 2 Jazzy workspace for a Scout 2.0 mobile base, Aubo i5 arm,
 MS42DC gripper, Gemini335 RGB-D camera, and C16 lidar.
+
+`main` integrates the latest committed `jetson` features for Ubuntu 24.04 / WSL2;
+`jetson` remains the Ubuntu 22.04 / ROS 2 Humble hardware branch.
+
+## Jazzy / WSL2 model preview
+
+![ROS 2 Jazzy model running in WSL2 RViz](docs/demo/jazzy-rviz.jpg)
+
+Actual Jazzy / WSL2 runtime capture: Scout base, Aubo arm, gripper, front basket
+and sensor rack. This is a default-pose model preview, not a hardware execution.
+
+On the tested WSL2 machine, Fast DDS discovered the model publisher but did not
+deliver its transient description/static transforms. Cyclone DDS restored the model:
+
+```bash
+sudo apt install ros-jazzy-rmw-cyclonedds-cpp
+source scripts/env/arachne_env.sh
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+source install/setup.bash
+ros2 launch arachne_operator teach_visualization.launch.py aubo_sdk_fallback_enabled:=false
+```
+
+For the dark showcase view, append
+`rviz_config:=$(ros2 pkg prefix --share arachne_description)/rviz/jazzy_showcase.rviz`.
+
+This preview uses the default model pose without contacting the arm SDK. For the
+operator UI without automatic hardware/service startup:
+
+```bash
+ros2 launch arachne_operator teach_panel.launch.py with_real_bringup:=false with_camera:=false autostart_managed_processes:=false
+```
+
+![Jazzy teach panel with managed services stopped](docs/demo/jazzy-teach-panel.jpg)
+
+The panel exposes pose presets, recording/replay, camera, navigation and grasp
+services. Hardware status is intentionally waiting in this offline capture.
+
+Validated on Ubuntu 24.04 / Jazzy: 13-package workspace build, offline checks,
+entrypoints, teach-panel headless check, grasp/road-cleanup dry runs, and the two
+live GUI views above. Gazebo packages were skipped because their build dependencies
+are absent on this machine. Real hardware operation was not tested.
 
 ## Build
 

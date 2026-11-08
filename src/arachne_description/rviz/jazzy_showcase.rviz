@@ -1,0 +1,45 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Ground
+      Plane: XY
+      Reference Frame: base_link
+      Cell Size: 0.5
+      Color: 85; 100; 120
+    - Class: rviz_default_plugins/RobotModel
+      Enabled: true
+      Name: Arachne
+      Description Source: Topic
+      Description Topic:
+        Value: /arachne/display/robot_description
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Depth: 5
+      Visual Enabled: true
+      Collision Enabled: false
+  Global Options:
+    Background Color: 25; 32; 45
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 2.5
+      Focal Point:
+        X: 0.0
+        Y: 0.0
+        Z: 0.5
+      Pitch: 0.4
+      Yaw: 0.75
+      Target Frame: base_link
+Window Geometry:
+  Width: 1500
+  Height: 950
+  X: 50
+  Y: 50

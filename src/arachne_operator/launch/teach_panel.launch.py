@@ -357,7 +357,9 @@ def generate_launch_description():
                 ),
                 "workspace_root": LaunchConfiguration("workspace_root"),
                 "runtime_log_root": LaunchConfiguration("runtime_log_root"),
-                "autostart_managed_processes": LaunchConfiguration("autostart_managed_processes"),
+                "autostart_managed_processes": ParameterValue(
+                    LaunchConfiguration("autostart_managed_processes"), value_type=str
+                ),
                 "service_stop_timeout_sec": ParameterValue(
                     LaunchConfiguration("service_stop_timeout_sec"), value_type=float
                 ),
