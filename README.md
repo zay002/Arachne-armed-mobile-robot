@@ -60,10 +60,23 @@ ros2 launch arachne_operator teach_panel.launch.py with_real_bringup:=false with
 The panel exposes pose presets, recording/replay, camera, navigation and grasp
 services. Hardware status is intentionally waiting in this offline capture.
 
-Validated on Ubuntu 24.04 / Jazzy: 13-package workspace build, offline checks,
+Validated on Ubuntu 24.04 / Jazzy: 15-package workspace build, offline checks,
 entrypoints, teach-panel headless check, grasp/road-cleanup dry runs, and the two
-live GUI views above. Gazebo packages were skipped because their build dependencies
-are absent on this machine. Real hardware operation was not tested.
+live GUI views above. The build script now correctly detects Gazebo dependencies
+using a CXX-enabled CMake probe. Real hardware operation was not tested.
+
+## Gazebo 仿真
+
+![Arachne running in Gazebo on Jazzy / WSL2](docs/demo/jazzy-gazebo.png)
+
+实际运行的 Jazzy / WSL2 仿真场景。自动程序完成了导航、对准、机械臂抓取路径、
+夹爪闭合、抬升和回位状态序列；这是控制流程验证，不等同于可靠的接触抓取评测。
+
+```bash
+source scripts/env/arachne_env.sh
+source install/setup.bash
+ros2 launch arachne_demo gazebo_autopick_demo.launch.py
+```
 
 ## Build
 
