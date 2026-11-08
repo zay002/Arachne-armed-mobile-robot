@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
 import signal
 import shlex
 import socket
+import re
 import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass, fields, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -21,7 +23,11 @@ import rclpy
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from rcl_interfaces.msg import Parameter as RosParameter
+from rcl_interfaces.msg import ParameterType, ParameterValue
+from rcl_interfaces.srv import SetParameters
 from rclpy.action import ActionClient
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile
@@ -30,7 +36,13 @@ from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from arachne_operator.control_owner import (
+    DEFAULT_AUBO_CONTROL_OWNER_PATH,
+    claim_control_owner as _claim_control_owner,
+    release_control_owner as _release_control_owner,
+)
 from arachne_operator.real_hardware_acceptance_test import AuboI5Kinematics
+from arachne_operator.repo_paths import root_dir
 
 
 DEFAULT_REAL_ARM_JOINTS = (
@@ -48,108 +60,36 @@ DEFAULT_AUBO_PAYLOAD_MASS_KG = 0.818
 DEFAULT_AUBO_PAYLOAD_COG = "0.039927,0.045067,0.143233"
 DEFAULT_AUBO_PAYLOAD_AOM = "0,0,0"
 DEFAULT_AUBO_PAYLOAD_INERTIA = "0,0,0,0,0,0"
-DEFAULT_ARM_BASE_XYZ = "0.22,0.0,0.155"
+DEFAULT_ARM_BASE_XYZ = "0.22,0.0,0.105"
 DEFAULT_ARM_BASE_RPY = "0.0,0.0,1.57079632679"
 DEFAULT_REAR_RACK_KEEPOUT_MIN_XYZ = "-0.41,-0.22,0.04"
 DEFAULT_REAR_RACK_KEEPOUT_MAX_XYZ = "0.09,0.22,0.82"
 DEFAULT_TEACH_CONFIG_PATH = "recordings/teach/teach_panel_config.json"
+DEFAULT_DEMO_RECORDING_PATH = "recordings/teach/arachne_teach_20260629_213710.json"
 DEFAULT_AUBO_TEACH_FLAG_PATH = "/tmp/arachne_aubo_teach_mode"
-DEFAULT_AUBO_CONTROL_OWNER_PATH = "/tmp/arachne_aubo_control_owner"
+GRIPPER_PRESET_COMMANDS = ("12000", "9000", "6000")
+GRIPPER_CUSTOM_MIN = 0
+GRIPPER_CUSTOM_MAX = 18720
 MANAGED_SERVICE_COMMAND_PARAMS = {
     "camera": "camera_command",
+    "depth_pointcloud": "depth_pointcloud_command",
     "viewer": "camera_view_command",
+    "yolo_viewer": "yolo_view_command",
     "slam": "slam_command",
     "grasp_server": "grasp_server_command",
+    "cleanup_server": "cleanup_server_command",
+    "step_cleanup_server": "step_cleanup_server_command",
 }
-
-
-def _control_owner_payload(owner: str) -> str:
-    return json.dumps(
-        {"owner": owner, "pid": os.getpid(), "created_at": time.time()},
-        separators=(",", ":"),
-    ) + "\n"
-
-
-def _parse_control_owner(text: str) -> tuple[str, int | None]:
-    text = text.strip()
-    if not text:
-        return "", None
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return text.splitlines()[0].strip(), None
-    owner = str(data.get("owner", "")).strip()
-    pid_value = data.get("pid")
-    try:
-        pid = int(pid_value) if pid_value is not None else None
-    except (TypeError, ValueError):
-        pid = None
-    return owner, pid
-
-
-def _pid_alive(pid: int | None) -> bool:
-    if pid is None:
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _claim_control_owner(path: Path, owner: str) -> tuple[bool, str]:
-    owner = owner.strip() or "unknown"
-    for _attempt in range(2):
-        try:
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                return False, f"unreadable owner file {path}: {exc}"
-            active_owner, pid = _parse_control_owner(text)
-            if active_owner == owner and pid == os.getpid():
-                return True, f"already owned by {owner}"
-            if pid is not None and not _pid_alive(pid):
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError as exc:
-                    return False, f"stale owner {active_owner or text!r} could not be cleared: {exc}"
-                continue
-            pid_text = str(pid) if pid is not None else "unknown"
-            return False, f"owned by {active_owner or text.strip() or 'unknown'} pid={pid_text}"
-        except OSError as exc:
-            return False, f"could not create owner file {path}: {exc}"
-
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(_control_owner_payload(owner))
-        except OSError as exc:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return False, f"could not write owner file {path}: {exc}"
-        return True, f"owned by {owner}"
-    return False, f"could not claim owner file {path}"
-
-
-def _release_control_owner(path: Path, owner: str) -> None:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except (FileNotFoundError, OSError):
-        return
-    active_owner, pid = _parse_control_owner(text)
-    if active_owner != (owner.strip() or "unknown"):
-        return
-    if pid is not None and pid != os.getpid():
-        return
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        return
+MANAGED_SERVICE_READY_SERVICES = {
+    "grasp_server": ("/arachne/grasp_task/status", "/arachne/grasp_task/start"),
+    "cleanup_server": ("/arachne/road_cleanup/status", "/arachne/road_cleanup/start"),
+    "step_cleanup_server": ("/arachne/step_cleanup/status", "/arachne/step_cleanup/start"),
+}
+MANAGED_SERVICE_READY_TOPICS = {
+    "grasp_server": "/arachne/grasp_task/state",
+    "cleanup_server": "/arachne/road_cleanup/state",
+    "step_cleanup_server": "/arachne/step_cleanup/state",
+}
 
 
 class AuboDirectJsonRpc:
@@ -211,6 +151,7 @@ class TeachWaypoint:
     kind: str = "pose"
     wait_sec: float = 0.0
     base_motion: list[dict] = field(default_factory=list)
+    task_command: str = ""
 
 
 @dataclass(frozen=True)
@@ -232,6 +173,10 @@ def _yaw_from_odom(msg: Odometry) -> float:
 
 
 def _parse_names(text: str) -> list[str]:
+    disabled = {"", "0", "false", "none", "off", "no"}
+    text = str(text).strip()
+    if text.lower() in disabled:
+        return []
     return [item.strip() for item in text.split(",") if item.strip()]
 
 
@@ -292,9 +237,29 @@ def _transform_from_xyz_rpy(xyz: np.ndarray, rpy: np.ndarray) -> np.ndarray:
     return transform
 
 
+def _normalize_gripper_command(command: object) -> str | None:
+    text = str(command).strip().lower()
+    if text in ("open", "close", "stop"):
+        return text
+    if text.isdigit():
+        value = int(text)
+        if GRIPPER_CUSTOM_MIN <= value <= GRIPPER_CUSTOM_MAX:
+            return str(value)
+    return None
+
+
+def _is_replay_gripper_command(command: object) -> bool:
+    normalized = _normalize_gripper_command(command)
+    return normalized is not None and normalized != "stop"
+
+
 def _waypoint_from_dict(data: dict) -> TeachWaypoint:
     known = {item.name for item in fields(TeachWaypoint)}
     filtered = {key: value for key, value in data.items() if key in known}
+    if "gripper" in filtered:
+        filtered["gripper"] = _normalize_gripper_command(filtered["gripper"]) or str(
+            filtered["gripper"]
+        ).strip().lower()
     return TeachWaypoint(**filtered)
 
 
@@ -319,15 +284,20 @@ class TeachPanelNode(Node):
         self.declare_parameter("base_angular_speed", 0.60)
         self.declare_parameter("base_replay_linear_speed", 0.40)
         self.declare_parameter("base_replay_angular_speed", 0.48)
+        self.declare_parameter("base_curve_replay_enabled", True)
+        self.declare_parameter("base_curve_publish_rate", 20.0)
+        self.declare_parameter("base_curve_min_turn_angle_rad", 0.05)
+        self.declare_parameter("base_curve_max_linear_speed", 0.0)
+        self.declare_parameter("base_curve_max_angular_speed", 0.0)
         self.declare_parameter("base_position_tolerance", 0.02)
         self.declare_parameter("base_yaw_tolerance_deg", 2.0)
         self.declare_parameter("base_manual_publish_rate", 12.0)
         self.declare_parameter("base_motion_max_segment_sec", 20.0)
         self.declare_parameter("base_ignore_spurious_zero_odom", True)
         self.declare_parameter("arm_jog_step_m", 0.008)
-        self.declare_parameter("arm_jog_duration_sec", 0.24)
+        self.declare_parameter("arm_jog_duration_sec", 0.06)
         self.declare_parameter("arm_rotate_step_rad", math.radians(0.7))
-        self.declare_parameter("arm_rotate_duration_sec", 0.24)
+        self.declare_parameter("arm_rotate_duration_sec", 0.06)
         self.declare_parameter("arm_joint_step_rad", math.radians(0.4))
         self.declare_parameter("arm_hold_period_sec", 0.10)
         self.declare_parameter("arm_manual_prefer_topic", True)
@@ -336,24 +306,24 @@ class TeachPanelNode(Node):
         )
         self.declare_parameter("arm_velocity_publish_rate", 80.0)
         self.declare_parameter("arm_velocity_watchdog_sec", 0.20)
-        self.declare_parameter("arm_joint_jog_speed_rad_sec", 0.08)
-        self.declare_parameter("arm_cartesian_jog_speed_m_sec", 0.025)
-        self.declare_parameter("arm_cartesian_rotate_speed_rad_sec", 0.08)
+        self.declare_parameter("arm_joint_jog_speed_rad_sec", 0.32)
+        self.declare_parameter("arm_cartesian_jog_speed_m_sec", 0.10)
+        self.declare_parameter("arm_cartesian_rotate_speed_rad_sec", 0.32)
         self.declare_parameter("arm_velocity_damping", 0.08)
-        self.declare_parameter("arm_velocity_max_joint_speed_rad_sec", 0.25)
+        self.declare_parameter("arm_velocity_max_joint_speed_rad_sec", 1.00)
         self.declare_parameter("arm_velocity_max_joint_accel_rad_sec2", 1.60)
         self.declare_parameter("arm_velocity_max_joint_jerk_rad_sec3", 24.0)
         self.declare_parameter("arm_velocity_smoothing_tau_sec", 0.08)
         self.declare_parameter("arm_velocity_keepout_predict_sec", 0.35)
         self.declare_parameter("arm_velocity_keepout_check_interval_sec", 0.05)
         self.declare_parameter("arm_velocity_stream_deadman_sec", 0.75)
-        self.declare_parameter("arm_waypoint_duration_sec", 3.75)
+        self.declare_parameter("arm_waypoint_duration_sec", 0.9375)
         self.declare_parameter("arm_replay_backend", "sdk_move_joint")
         self.declare_parameter("aubo_sdk_ip", os.environ.get("AUBO_ROBOT_IP", "192.168.127.128"))
         self.declare_parameter("aubo_sdk_rpc_port", 30004)
         self.declare_parameter("aubo_sdk_rpc_timeout_sec", 3.0)
-        self.declare_parameter("aubo_sdk_move_speed_rad_sec", 0.25)
-        self.declare_parameter("aubo_sdk_move_accel_rad_sec2", 0.45)
+        self.declare_parameter("aubo_sdk_move_speed_rad_sec", 1.44)
+        self.declare_parameter("aubo_sdk_move_accel_rad_sec2", 1.8)
         self.declare_parameter("aubo_sdk_blend_radius", 0.0)
         self.declare_parameter("aubo_sdk_move_duration_sec", 0.0)
         self.declare_parameter("aubo_sdk_goal_tolerance_rad", 0.04)
@@ -389,13 +359,19 @@ class TeachPanelNode(Node):
         self.declare_parameter("arm_keepout_joint_step_rad", 0.06)
         self.declare_parameter("aubo_teach_command_topic", "/arachne/aubo/teach_command")
         self.declare_parameter("aubo_teach_exit_wait_sec", 8.0)
-        self.declare_parameter("replay_settle_sec", 0.2)
+        self.declare_parameter("replay_settle_sec", 0.05)
+        self.declare_parameter("visual_grasp_replay_timeout_sec", 180.0)
+        self.declare_parameter("visual_grasp_replay_poll_sec", 0.5)
         self.declare_parameter("gripper_settle_sec", 2.0)
         self.declare_parameter("recording_dir", "recordings/teach")
         self.declare_parameter("teach_config_path", DEFAULT_TEACH_CONFIG_PATH)
         self.declare_parameter("teach_config_autoload", True)
         self.declare_parameter("workspace_root", "")
         self.declare_parameter("runtime_log_root", "log/teach_panel")
+        self.declare_parameter(
+            "autostart_managed_processes",
+            "camera,depth_pointcloud,viewer,grasp_server,cleanup_server",
+        )
         self.declare_parameter("service_stop_timeout_sec", 4.0)
         self.declare_parameter(
             "camera_command",
@@ -403,27 +379,105 @@ class TeachPanelNode(Node):
                 "ros2 launch arachne_sensors gemini335.launch.py "
                 "publish_pointcloud:=false with_color_view:=false with_depth_view:=false "
                 "with_tf:=true camera_parent_frame:=ee_camera_link "
-                "projection_flip_x:=true projection_flip_y:=true"
+                "color_width:=640 color_height:=480 color_fps:=30.0 "
+                "depth_width:=640 depth_height:=480 depth_fps:=15.0 "
+                "color_v4l2_controls:=brightness=20,exposure_auto=0,exposure_absolute=45,gain=0 "
+                "camera_optical_x:=0.0201 camera_optical_y:=0.0 "
+                "camera_optical_z:=0.2196 camera_optical_roll:=0.196 "
+                "camera_optical_pitch:=-0.024 camera_optical_yaw:=-1.570796327 "
+                "projection_flip_x:=true projection_flip_y:=true color_yuv_layout:=YUYV"
             ),
         )
         self.declare_parameter(
             "camera_view_command",
             (
-                "${ARACHNE_SYSTEM_PYTHON:-python3} scripts/vision/raw_image_viewer.py "
-                "--topic /camera/color/image_raw --window \"Arachne Raw Camera\" --max-fps 15"
+                "ros2 run arachne_operator raw_image_viewer "
+                "--topic /camera/color/image_raw --window \"Arachne Raw Camera\" --max-fps 30"
             ),
         )
-        self.declare_parameter("slam_command", "scripts/hardware/real_lidar_nav.sh")
+        self.declare_parameter(
+            "yolo_view_command",
+            (
+                "ros2 run arachne_operator raw_image_viewer "
+                "--topic /camera/color/image_raw --window \"智慧出行\" --max-fps 30 "
+                "--yolo-model yolo_workspace/weights/trash_yolo26n_seg_best.onnx "
+                "--yolo-task segment --yolo-imgsz 640 --yolo-conf 0.25 --yolo-every 5 "
+                "--yolo-device cpu --yolo-venv yolo_workspace/.venv"
+            ),
+        )
+        self.declare_parameter(
+            "depth_pointcloud_command",
+            (
+                "ros2 run arachne_sensors depth_to_pointcloud --ros-args "
+                "-p frames:=1 -p stride:=4 -p max_depth_m:=3.0 "
+                "-p projection_flip_x:=false -p projection_flip_y:=false "
+                "-p continuous:=true -p target_frame:=base_link "
+                "-p min_target_z_m:=-10.0 -p max_target_z_m:=0.0 "
+                "-p min_publish_points:=1000 "
+                "-p exit_after_publish:=false "
+                "-p pointcloud_topic:=/arachne/debug/depth_points"
+            ),
+        )
+        self.declare_parameter(
+            "slam_command",
+            (
+                "ros2 launch arachne_nav nav2_lidar.launch.py "
+                "with_lslidar_driver:=true with_pointcloud_to_scan:=true "
+                "with_robot_state_publisher:=false with_rviz:=true"
+            ),
+        )
         self.declare_parameter(
             "grasp_server_command",
             (
-                "scripts/vision/grasp_task_server.sh "
+                "ros2 launch arachne_operator grasp_task_server.launch.py "
                 "execute_real:=true confirm_execute_real:=true with_rviz:=false "
-                "preview_on_start:=false planning_recovery_base_enabled:=false "
-                "require_odom:=false require_camera_topics:=true "
-                "require_aubo_status:=false require_gripper_status:=false "
-                "max_grasp_attempts:=3 retry_on_gripper_miss:=true"
+                "confidence:=0.03 "
+                "grasp_base_offset:=-0.23,0.01,0.16 "
+                "real_fixed_post_grasp:=true "
+                "real_fixed_search_joints:=-1.611779,-0.457910,1.071527,-0.044520,1.575231,0.771459 "
+                "real_sdk_move_speed:=0.18 "
+                "real_sdk_move_accel:=0.25 "
+                "prefer_aubo_move_joint_action:=false "
+                "aubo_move_joint_fallback_internal:=false "
+                "extra_args:='--planner-backend local --imgsz 640 --inference-period 0.5 --min-detection-mask-area-px 0 "
+                "--reject-label-keywords=person,kite --planning-key-waypoints grasp "
+                "--detection-min-center-y-ratio 0.38 "
+                "--preferred-label-keywords bottle,carton,can,cup,container,jar,box "
+                "--arm-collision-samples-per-link 1 --arm-collision-radius 0.018 "
+                "--collision-margin 0.0 --rear-rack-collision-margin 0.0 "
+                "--trajectory-max-duration 8 --max-grasp-orientation-candidates 1 "
+                "--local-planning-timeout-sec 4.0 --local-ik-max-iterations 120 "
+                "--lock-grasp-orientation --grasp-topdown-max-tilt-deg 20 "
+                "--grasp-orientation-yaw-offsets-deg 0 --grasp-orientation-tilt-offsets-deg 0 "
+                "--local-position-tolerance 0.010 --local-orientation-tolerance 0.35 "
+                "--real-sdk-arrival-timeout-padding 10 "
+                "--real-sdk-max-targets 4 --real-sdk-semantic-targets-only' "
+                "preview_on_start:=true warm_execute_preview:=true planning_recovery_base_enabled:=false skip_preflight:=true "
+                "preflight_timeout_sec:=0.5 require_odom:=false require_joint_states:=false require_camera_topics:=false "
+                "require_aubo_status:=false require_gripper_status:=true "
+                "max_grasp_attempts:=2 retry_on_gripper_miss:=true"
             ),
+        )
+        self.declare_parameter(
+            "cleanup_server_command",
+            (
+                "ros2 launch arachne_operator road_cleanup_task_server.launch.py "
+                "patrol_pattern:=line patrol_distance_m:=1.0 patrol_step_m:=0.20 "
+                "max_round_trips:=1 loop:=false "
+                "patrol_base_speed_mps:=0.05 base_step_timeout_sec:=120.0 "
+                "grasp_timeout_sec:=180.0 "
+                "candidate_min_base_z_m:=-0.18 candidate_max_reach_m:=1.03 "
+                "reach_recovery_enabled:=false "
+                "scan_warmup_sec:=4.0 initial_detection_wait_sec:=45.0 "
+                "skip_preflight:=true move_to_search_pose_before_start:=true require_search_pose_before_start:=true "
+                "required_search_joints:=-1.611779,-0.457910,1.071527,-0.044520,1.575231,0.771459 "
+                "required_search_tolerance_rad:=0.08 "
+                "detection_confidence:=0.08 detection_timeout_sec:=3.0"
+            ),
+        )
+        self.declare_parameter(
+            "step_cleanup_server_command",
+            "ros2 launch arachne_operator step_cleanup_demo.launch.py",
         )
         self.declare_parameter("grasp_task_state_topic", "/arachne/grasp_task/state")
         self.declare_parameter("grasp_task_start_service", "/arachne/grasp_task/start")
@@ -431,6 +485,24 @@ class TeachPanelNode(Node):
         self.declare_parameter("grasp_task_restore_service", "/arachne/grasp_task/restore")
         self.declare_parameter("grasp_task_status_service", "/arachne/grasp_task/status")
         self.declare_parameter("grasp_task_preflight_service", "/arachne/grasp_task/preflight")
+        self.declare_parameter(
+            "grasp_task_parameter_service", "/arachne_grasp_task_server/set_parameters"
+        )
+        self.declare_parameter("cleanup_task_state_topic", "/arachne/road_cleanup/state")
+        self.declare_parameter("cleanup_task_start_service", "/arachne/road_cleanup/start")
+        self.declare_parameter("cleanup_task_pause_service", "/arachne/road_cleanup/pause")
+        self.declare_parameter(
+            "cleanup_task_return_home_service", "/arachne/road_cleanup/return_home"
+        )
+        self.declare_parameter("cleanup_task_stop_service", "/arachne/road_cleanup/stop")
+        self.declare_parameter("cleanup_task_status_service", "/arachne/road_cleanup/status")
+        self.declare_parameter("cleanup_task_preflight_service", "/arachne/road_cleanup/preflight")
+        self.declare_parameter("step_cleanup_state_topic", "/arachne/step_cleanup/state")
+        self.declare_parameter("step_cleanup_start_service", "/arachne/step_cleanup/start")
+        self.declare_parameter("step_cleanup_stop_service", "/arachne/step_cleanup/stop")
+        self.declare_parameter("step_cleanup_status_service", "/arachne/step_cleanup/status")
+        self.declare_parameter("step_cleanup_preflight_service", "/arachne/step_cleanup/preflight")
+        self.declare_parameter("skip_task_preflight", True)
 
         self.arm_state_joint_names = _parse_names(str(self.get_parameter("arm_state_joint_names").value))
         self.arm_command_joint_names = _parse_names(
@@ -485,6 +557,43 @@ class TeachPanelNode(Node):
                 Trigger, str(self.get_parameter("grasp_task_preflight_service").value)
             ),
         }
+        self.grasp_task_parameter_client = self.create_client(
+            SetParameters, str(self.get_parameter("grasp_task_parameter_service").value)
+        )
+        self.cleanup_task_clients = {
+            "start": self.create_client(
+                Trigger, str(self.get_parameter("cleanup_task_start_service").value)
+            ),
+            "pause": self.create_client(
+                Trigger, str(self.get_parameter("cleanup_task_pause_service").value)
+            ),
+            "return_home": self.create_client(
+                Trigger, str(self.get_parameter("cleanup_task_return_home_service").value)
+            ),
+            "stop": self.create_client(
+                Trigger, str(self.get_parameter("cleanup_task_stop_service").value)
+            ),
+            "status": self.create_client(
+                Trigger, str(self.get_parameter("cleanup_task_status_service").value)
+            ),
+            "preflight": self.create_client(
+                Trigger, str(self.get_parameter("cleanup_task_preflight_service").value)
+            ),
+        }
+        self.step_cleanup_clients = {
+            "start": self.create_client(
+                Trigger, str(self.get_parameter("step_cleanup_start_service").value)
+            ),
+            "stop": self.create_client(
+                Trigger, str(self.get_parameter("step_cleanup_stop_service").value)
+            ),
+            "status": self.create_client(
+                Trigger, str(self.get_parameter("step_cleanup_status_service").value)
+            ),
+            "preflight": self.create_client(
+                Trigger, str(self.get_parameter("step_cleanup_preflight_service").value)
+            ),
+        }
 
         self.create_subscription(Odometry, odom_topic, self._odom_callback, 10)
         self.create_subscription(JointState, joint_states_topic, self._joint_state_callback, 10)
@@ -499,6 +608,18 @@ class TeachPanelNode(Node):
             self._grasp_task_state_callback,
             10,
         )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("cleanup_task_state_topic").value),
+            self._cleanup_task_state_callback,
+            10,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("step_cleanup_state_topic").value),
+            self._step_cleanup_state_callback,
+            10,
+        )
 
         self.kinematics = AuboI5Kinematics()
         self.lock = threading.Lock()
@@ -508,6 +629,7 @@ class TeachPanelNode(Node):
         self.active_base_motion: dict | None = None
         self.base_motion_recording_enabled = False
         self.manual_base_velocity: tuple[float, float] | None = None
+        self.base_target_motion_active = False
         self.manual_arm_stream_command: dict[str, object] | None = None
         self.manual_arm_stream_deadline = 0.0
         self.manual_arm_velocity: list[float] | None = None
@@ -526,6 +648,7 @@ class TeachPanelNode(Node):
             "Aubo": "waiting",
             "Gripper": "waiting",
             "Grasp": "waiting",
+            "Road": "waiting",
         }
         self.aubo_teach_gate_active = False
         self.aubo_teach_ready_event = threading.Event()
@@ -536,6 +659,7 @@ class TeachPanelNode(Node):
         self.replay_thread: threading.Thread | None = None
         self._active_goal_handle = None
         self._last_manual_arm_stream_status = 0.0
+        self.aubo_reachable = False
         self.workspace_root = self._resolve_workspace_root()
         self.runtime_log_dir = self._make_runtime_log_dir()
         self.event_log_path = self.runtime_log_dir / "events.jsonl"
@@ -543,22 +667,34 @@ class TeachPanelNode(Node):
         self.managed_process_logs: dict[str, Path] = {}
         self.managed_process_log_handles: dict[str, Any] = {}
         self.last_logged_hardware_status: dict[str, str] = {}
+        self.autostart_managed_processes = _parse_names(
+            str(self.get_parameter("autostart_managed_processes").value)
+        )
+        self.autostart_requested = False
         if bool(self.get_parameter("teach_config_autoload").value):
             self.load_teach_config(status=False)
         publish_rate = max(float(self.get_parameter("base_manual_publish_rate").value), 1.0)
         self.create_timer(1.0 / publish_rate, self._publish_manual_base_velocity)
         arm_velocity_rate = max(float(self.get_parameter("arm_velocity_publish_rate").value), 1.0)
         self.create_timer(1.0 / arm_velocity_rate, self._publish_manual_arm_velocity)
+        self.create_timer(1.0, self._autostart_managed_processes_once)
         self._status(f"ready; logs={self.runtime_log_dir}")
+
+    def _autostart_managed_processes_once(self) -> None:
+        if self.autostart_requested or not self.autostart_managed_processes:
+            return
+        self.autostart_requested = True
+        for name in self.autostart_managed_processes:
+            if name not in MANAGED_SERVICE_COMMAND_PARAMS:
+                self._status(f"autostart ignored unknown service: {name}", warn=True)
+                continue
+            self._start_worker(lambda service=name: self._start_managed_process_worker(service))
 
     def _resolve_workspace_root(self) -> Path:
         configured = str(self.get_parameter("workspace_root").value).strip()
         if configured:
             return Path(configured).expanduser().resolve()
-        for parent in Path(__file__).resolve().parents:
-            if (parent / "scripts/env/arachne_env.sh").exists():
-                return parent
-        return Path.cwd().resolve()
+        return root_dir()
 
     def _workspace_path(self, path: str | Path) -> Path:
         resolved = Path(str(path)).expanduser()
@@ -626,6 +762,9 @@ class TeachPanelNode(Node):
         return current_nonzero
 
     def _joint_state_callback(self, msg: JointState) -> None:
+        with self.lock:
+            if not self._aubo_reachable_locked():
+                return
         positions = dict(zip(msg.name, msg.position))
         updates: dict[str, float] = {}
         for name in self.arm_state_joint_names:
@@ -652,10 +791,56 @@ class TeachPanelNode(Node):
             with self.lock:
                 self.hardware_status[key] = data
                 if key == "Aubo":
+                    reachability = self._infer_aubo_reachability_locked(data)
+                    if reachability is False:
+                        self.aubo_reachable = False
+                        self.current_arm.clear()
+                        self.tool_position = None
+                    elif reachability is True:
+                        self.aubo_reachable = True
                     self._update_aubo_teach_state_locked(data)
             self._log_hardware_status_change(key, data)
 
         return callback
+
+    def _is_aubo_unreachable_status_locked(self, status: str) -> bool:
+        lower = status.strip().lower()
+        return any(
+            keyword in lower
+            for keyword in (
+                "not reachable",
+                "unreachable",
+                "offline",
+                "connection refused",
+                "timeout",
+                "timed out",
+            )
+        )
+
+    def _infer_aubo_reachability_locked(self, status: str) -> bool | None:
+        lower = status.strip().lower()
+        if self._is_aubo_unreachable_status_locked(lower):
+            return False
+
+        # Keep `aubo_reachable` tied to explicit connectivity status messages.
+        # Other service-status texts (e.g. action server ready) should not
+        # re-enable controls.
+        if "reachable" in lower and "not" not in lower:
+            return True
+        if lower.startswith("aubo") and "mode=" in lower:
+            mode = re.search(r"mode=([a-z_]+)", lower)
+            safety = re.search(r"safety=([a-z_]+)", lower)
+            if mode is not None and safety is not None:
+                return mode.group(1) == "running" and safety.group(1) in {
+                    "normal",
+                    "reducedmode",
+                }
+        if lower in {"", "waiting", "unknown"}:
+            return False
+        return None
+
+    def _aubo_reachable_locked(self) -> bool:
+        return self.aubo_reachable
 
     def _update_aubo_teach_state_locked(self, status: str) -> None:
         data = status.strip().lower()
@@ -671,8 +856,9 @@ class TeachPanelNode(Node):
         first = data.split(":", 1)[0].strip().lower()
         with self.lock:
             self.hardware_status["Gripper"] = data
-            if first in ("open", "close", "stop"):
-                self.gripper_state = first
+            command = _normalize_gripper_command(first)
+            if command is not None:
+                self.gripper_state = command
         self._log_hardware_status_change("Gripper", data)
 
     def _grasp_task_state_callback(self, msg: String) -> None:
@@ -689,35 +875,88 @@ class TeachPanelNode(Node):
             self.hardware_status["Grasp"] = label
         self._log_hardware_status_change("Grasp", label)
 
+    def _cleanup_task_state_callback(self, msg: String) -> None:
+        data = msg.data.strip()
+        label = data
+        try:
+            payload = json.loads(data)
+            state = str(payload.get("state", "unknown"))
+            message = str(payload.get("message", "")).strip()
+            progress = payload.get("progress_m")
+            prefix = f"{state}: {message}" if message else state
+            if isinstance(progress, (int, float)):
+                prefix = f"{prefix} ({float(progress):.2f}m)"
+            label = prefix
+        except json.JSONDecodeError:
+            pass
+        with self.lock:
+            self.hardware_status["Road"] = label
+        self._log_hardware_status_change("Road", label)
+
+    def _step_cleanup_state_callback(self, msg: String) -> None:
+        data = msg.data.strip()
+        label = data
+        try:
+            payload = json.loads(data)
+            state = str(payload.get("state", "unknown"))
+            message = str(payload.get("message", "")).strip()
+            progress = payload.get("progress_m")
+            prefix = f"{state}: {message}" if message else state
+            if isinstance(progress, (int, float)):
+                prefix = f"{prefix} ({float(progress):.2f}m)"
+            label = prefix
+        except json.JSONDecodeError:
+            pass
+        with self.lock:
+            self.hardware_status["Step"] = label
+        self._log_hardware_status_change("Step", label)
+
     def snapshot(self) -> dict[str, str]:
         with self.lock:
             base = self.base_pose
-            tool = self.tool_position
-            arm_ready = self._current_arm_vector_locked() is not None
+            tool = self.tool_position if self._aubo_reachable_locked() else None
+            tool_base = self._tool_base_link_locked(tool) if tool is not None else None
+            arm_ready = (
+                self._current_arm_vector_locked() is not None and self._aubo_reachable_locked()
+            )
             managed = {
                 key: self._managed_process_status_locked(key)
                 for key in MANAGED_SERVICE_COMMAND_PARAMS
             }
+            tool_aubo_text = (
+                f"x={tool[0]:.3f} y={tool[1]:.3f} z={tool[2]:.3f}"
+                if tool
+                else "waiting"
+            )
+            tool_base_text = (
+                f"x={tool_base[0]:.3f} y={tool_base[1]:.3f} z={tool_base[2]:.3f}"
+                if tool_base
+                else "waiting"
+            )
             return {
                 "base": (
                     f"x={base.x:.3f} y={base.y:.3f} yaw={math.degrees(base.yaw):.1f}deg"
                     if base
                     else "waiting"
                 ),
-                "tool": (
-                    f"x={tool[0]:.3f} y={tool[1]:.3f} z={tool[2]:.3f}"
-                    if tool
-                    else "waiting"
-                ),
+                "tool": tool_aubo_text,
+                "tool_aubo": tool_aubo_text,
+                "tool_base": tool_base_text,
                 "arm": "ready" if arm_ready else "waiting",
                 "gripper": self.gripper_state,
                 "teach": "on" if self.aubo_teach_gate_active else "off",
                 "grasp_task": self.hardware_status.get("Grasp", "waiting"),
+                "road_cleanup": self.hardware_status.get("Road", "waiting"),
+                "step_cleanup": self.hardware_status.get("Step", "waiting"),
                 "status": self.last_status,
                 "camera": managed["camera"],
+                "depth_pointcloud": managed["depth_pointcloud"],
                 "viewer": managed["viewer"],
+                "yolo_viewer": managed["yolo_viewer"],
                 "slam": managed["slam"],
                 "grasp_server": managed["grasp_server"],
+                "cleanup_server": managed["cleanup_server"],
+                "step_cleanup_server": managed["step_cleanup_server"],
                 "log_dir": str(self.runtime_log_dir),
                 **self.hardware_status,
             }
@@ -731,7 +970,35 @@ class TeachPanelNode(Node):
 
     def tool_snapshot(self) -> tuple[float, float, float] | None:
         with self.lock:
+            if not self._aubo_reachable_locked():
+                return None
             return tuple(self.tool_position) if self.tool_position is not None else None
+
+    def arm_gripper_snapshot(self) -> tuple[list[float], list[float], str]:
+        with self.lock:
+            arm = self._current_arm_vector_locked()
+            tool = self.tool_position
+            gripper = self.gripper_state
+            if arm is None or tool is None:
+                raise RuntimeError("missing Aubo /joint_states")
+            return (
+                [float(value) for value in arm],
+                [float(value) for value in tool],
+                gripper,
+            )
+
+    def _tool_base_link_locked(
+        self, tool: tuple[float, float, float]
+    ) -> tuple[float, float, float] | None:
+        try:
+            arm_base = _transform_from_xyz_rpy(
+                _parse_vector3(str(self.get_parameter("arm_base_xyz").value)),
+                _parse_vector3(str(self.get_parameter("arm_base_rpy").value)),
+            )
+            point = arm_base @ np.array([tool[0], tool[1], tool[2], 1.0], dtype=float)
+            return (float(point[0]), float(point[1]), float(point[2]))
+        except Exception:
+            return None
 
     def log_snapshot(self) -> list[str]:
         with self.lock:
@@ -774,6 +1041,12 @@ class TeachPanelNode(Node):
                 ),
                 "arm_waypoint_duration_sec": float(
                     self.get_parameter("arm_waypoint_duration_sec").value
+                ),
+                "arm_speed_rad_sec": float(
+                    self.get_parameter("aubo_sdk_move_speed_rad_sec").value
+                ),
+                "arm_accel_rad_sec2": float(
+                    self.get_parameter("aubo_sdk_move_accel_rad_sec2").value
                 ),
                 "gripper_settle_sec": float(self.get_parameter("gripper_settle_sec").value),
             },
@@ -925,6 +1198,36 @@ class TeachPanelNode(Node):
                     ),
                 ),
                 Parameter(
+                    "aubo_sdk_move_speed_rad_sec",
+                    Parameter.Type.DOUBLE,
+                    float(
+                        motion.get(
+                            "arm_speed_rad_sec",
+                            self.get_parameter("aubo_sdk_move_speed_rad_sec").value,
+                        )
+                    ),
+                ),
+                Parameter(
+                    "arm_velocity_max_joint_speed_rad_sec",
+                    Parameter.Type.DOUBLE,
+                    float(
+                        motion.get(
+                            "arm_speed_rad_sec",
+                            self.get_parameter("arm_velocity_max_joint_speed_rad_sec").value,
+                        )
+                    ),
+                ),
+                Parameter(
+                    "aubo_sdk_move_accel_rad_sec2",
+                    Parameter.Type.DOUBLE,
+                    float(
+                        motion.get(
+                            "arm_accel_rad_sec2",
+                            self.get_parameter("aubo_sdk_move_accel_rad_sec2").value,
+                        )
+                    ),
+                ),
+                Parameter(
                     "gripper_settle_sec",
                     Parameter.Type.DOUBLE,
                     float(
@@ -1058,6 +1361,10 @@ class TeachPanelNode(Node):
             "back": (-linear, 0.0),
             "left": (0.0, angular),
             "right": (0.0, -angular),
+            "forward_left": (linear, angular),
+            "forward_right": (linear, -angular),
+            "back_left": (-linear, angular),
+            "back_right": (-linear, -angular),
             "stop": (0.0, 0.0),
         }
         vx, wz = mapping.get(direction, (0.0, 0.0))
@@ -1065,6 +1372,65 @@ class TeachPanelNode(Node):
         with self.lock:
             self.manual_base_velocity = None if direction == "stop" else (vx, wz)
         self.set_base_velocity(vx, wz)
+
+    def move_base_distance(self, distance_m: float) -> None:
+        value = float(distance_m)
+        max_distance = abs(
+            float(self.get_parameter("base_motion_max_segment_sec").value)
+            * float(self.get_parameter("base_linear_speed").value)
+        )
+        if not math.isfinite(value) or abs(value) < 1e-9 or abs(value) > max_distance:
+            self._status(f"base distance ignored: max={max_distance:.2f}m", warn=True)
+            return
+        self._start_base_target_motion("distance", value)
+
+    def turn_base_relative(self, angle_rad: float) -> None:
+        value = float(angle_rad)
+        if not math.isfinite(value) or abs(value) < 1e-9 or abs(value) > math.tau:
+            self._status("base turn ignored: angle must be <= 360deg", warn=True)
+            return
+        self._start_base_target_motion("turn", value)
+
+    def _start_base_target_motion(self, kind: str, value: float) -> None:
+        if not math.isfinite(value) or abs(value) < 1e-9:
+            self._status("base target ignored: value must be non-zero and finite", warn=True)
+            return
+        with self.lock:
+            if self.base_target_motion_active:
+                busy = True
+            else:
+                busy = False
+                self.base_target_motion_active = True
+        if busy:
+            self._status("base target ignored: another base target is running", warn=True)
+            return
+        self._start_worker(lambda: self._base_target_motion_worker(kind, value))
+
+    def _base_target_motion_worker(self, kind: str, value: float) -> None:
+        try:
+            self.cancel_event.clear()
+            self.drive_base_manual("stop")
+            self._current_base_pose()
+            if kind == "distance":
+                speed = abs(float(self.get_parameter("base_replay_linear_speed").value))
+                direction = "forward" if value >= 0.0 else "back"
+                self._track_base_motion(direction, math.copysign(speed, value), 0.0)
+                self._status(f"base target {direction}: {abs(value):.3f}m")
+                self._drive_distance(value)
+                return
+
+            speed = abs(float(self.get_parameter("base_replay_angular_speed").value))
+            direction = "left" if value >= 0.0 else "right"
+            self._track_base_motion(direction, 0.0, math.copysign(speed, value))
+            self._status(f"base target {direction}: {abs(math.degrees(value)):.1f}deg")
+            self._turn_relative(value)
+        except Exception as exc:
+            self.set_base_velocity(0.0, 0.0)
+            self._status(f"base target failed: {exc}", warn=True)
+        finally:
+            self._track_base_motion("stop", 0.0, 0.0)
+            with self.lock:
+                self.base_target_motion_active = False
 
     def stop_all(self) -> None:
         self.cancel_event.set()
@@ -1091,12 +1457,18 @@ class TeachPanelNode(Node):
         self._status("arm hold current requested")
 
     def publish_gripper(self, command: str) -> None:
+        command = _normalize_gripper_command(command)
+        if command is None:
+            self._status(
+                f"gripper command must be open, close, stop, or {GRIPPER_CUSTOM_MIN}-{GRIPPER_CUSTOM_MAX}",
+                warn=True,
+            )
+            return
         msg = String()
         msg.data = command
         self.gripper_pub.publish(msg)
         with self.lock:
-            if command in ("open", "close", "stop"):
-                self.gripper_state = command
+            self.gripper_state = command
         self._status(f"gripper {command}")
 
     def set_aubo_teach(self, enabled: bool) -> None:
@@ -1244,17 +1616,42 @@ class TeachPanelNode(Node):
         self._status(f"aubo teach_off timeout before replay: {status}", warn=True)
         return False
 
-    def call_grasp_task(self, command: str) -> None:
+    def call_grasp_task(self, command: str, release_point: str | None = None) -> None:
         command = str(command).strip().lower()
         if command not in self.grasp_task_clients:
             self._status(f"grasp task ignored unknown command: {command}", warn=True)
             return
-        self._start_worker(lambda: self._call_grasp_task_worker(command))
+        if release_point is not None:
+            release_point = str(release_point).strip().lower()
+            if release_point not in {"basket_a", "basket_b"}:
+                self._status(f"grasp task ignored unknown release point: {release_point}", warn=True)
+                return
+        self._write_event(
+            "grasp_task_button",
+            f"grasp task button requested: {command}",
+            command=command,
+            release_point=release_point or "",
+        )
+        self._start_worker(lambda: self._call_grasp_task_worker(command, release_point))
 
-    def visual_grasp_start(self) -> None:
-        self._start_worker(self._visual_grasp_start_worker)
+    def call_cleanup_task(self, command: str) -> None:
+        command = str(command).strip().lower()
+        if command not in self.cleanup_task_clients:
+            self._status(f"road cleanup ignored unknown command: {command}", warn=True)
+            return
+        self._start_worker(lambda: self._call_cleanup_task_worker(command))
 
-    def _visual_grasp_start_worker(self) -> None:
+    def call_step_cleanup(self, command: str) -> None:
+        command = str(command).strip().lower()
+        if command not in self.step_cleanup_clients:
+            self._status(f"step cleanup ignored unknown command: {command}", warn=True)
+            return
+        self._start_worker(lambda: self._call_step_cleanup_worker(command))
+
+    def visual_grasp_start(self, release_point: str | None = None) -> None:
+        self._start_worker(lambda: self._visual_grasp_start_worker(release_point))
+
+    def _visual_grasp_start_worker(self, release_point: str | None = None) -> bool:
         self.drive_base_manual("stop")
         self.stop_arm_velocity_hold()
         if self._aubo_teach_gate_may_be_active():
@@ -1264,22 +1661,28 @@ class TeachPanelNode(Node):
             )
             if not ready or self._aubo_teach_gate_may_be_active():
                 self._status("visual grasp blocked: Aubo teach mode still active", warn=True)
-                return
+                return False
 
         self._status("visual grasp: starting camera, raw view, and grasp server")
         self._start_managed_process_worker("camera")
         time.sleep(0.8)
+        self._stop_managed_process_worker("depth_pointcloud", quiet=True)
+        self._start_managed_process_worker("depth_pointcloud")
         self._start_managed_process_worker("viewer")
         self._start_managed_process_worker("grasp_server")
+
+        if bool(self.get_parameter("skip_task_preflight").value):
+            self._status("visual grasp: startup preflight trusted, starting task")
+            return self._call_grasp_task_worker("start", release_point)
 
         preflight = self.grasp_task_clients.get("preflight")
         if preflight is None:
             self._status("visual grasp blocked: missing preflight client", warn=True)
-            return
+            return False
         service_name = getattr(preflight, "srv_name", "preflight")
         if not preflight.wait_for_service(timeout_sec=15.0):
             self._status(f"visual grasp blocked: preflight unavailable: {service_name}", warn=True)
-            return
+            return False
 
         deadline = time.monotonic() + 30.0
         last_message = ""
@@ -1295,8 +1698,7 @@ class TeachPanelNode(Node):
             message = response.message if response is not None else "empty response"
             if success:
                 self._status("visual grasp: preflight ok, starting task")
-                self._call_grasp_task_worker("start")
-                return
+                return self._call_grasp_task_worker("start", release_point)
 
             failures = self._required_preflight_failures(message)
             last_message = self._format_preflight_failures(failures, message)
@@ -1306,15 +1708,18 @@ class TeachPanelNode(Node):
                 time.sleep(0.8)
                 continue
             self._status(f"visual grasp blocked: {last_message}", warn=True)
-            return
+            return False
 
         self._status(f"visual grasp blocked: preflight never became ready ({last_message})", warn=True)
+        return False
 
-    def _call_grasp_task_worker(self, command: str) -> None:
+    def _call_grasp_task_worker(self, command: str, release_point: str | None = None) -> bool:
         client = self.grasp_task_clients.get(command)
         if client is None:
             self._status(f"grasp task service missing: {command}", warn=True)
-            return
+            return False
+        if command == "start" and release_point is None:
+            release_point = "basket_a"
         if command == "start":
             self.drive_base_manual("stop")
             self.stop_arm_velocity_hold()
@@ -1325,25 +1730,152 @@ class TeachPanelNode(Node):
                 )
                 if not ready or self._aubo_teach_gate_may_be_active():
                     self._status("grasp task start blocked: Aubo teach mode still active", warn=True)
-                    return
+                    return False
+            self._stop_managed_process_worker("depth_pointcloud", quiet=True)
+            self._start_managed_process_worker("depth_pointcloud")
+            if release_point is not None and not self._set_grasp_task_release_point(release_point):
+                return False
         if command in {"stop", "restore"}:
             self.drive_base_manual("stop")
             self.stop_arm_velocity_hold()
 
         service_name = getattr(client, "srv_name", command)
+        self._write_event(
+            "grasp_task_service_call",
+            f"calling grasp task service: {service_name}",
+            command=command,
+            service=service_name,
+        )
         self._status(f"grasp task {command} requested")
         if not client.wait_for_service(timeout_sec=1.5):
             self._status(f"grasp task {command} unavailable: {service_name}", warn=True)
-            return
+            return False
         future = client.call_async(Trigger.Request())
         if not self._wait_service_future(future, 8.0):
             self._status(f"grasp task {command} timeout: {service_name}", warn=True)
-            return
+            return False
         response = future.result()
         success = bool(response.success) if response is not None else False
         message = response.message if response is not None else "empty response"
         self._status(
             f"grasp task {command} {'ok' if success else 'failed'}: "
+            f"{self._short_grasp_task_message(message)}",
+            warn=not success,
+        )
+        return success
+
+    def _set_grasp_task_release_point(self, release_point: str) -> bool:
+        client = self.grasp_task_parameter_client
+        service_name = getattr(client, "srv_name", "grasp release point")
+        if not client.wait_for_service(timeout_sec=1.5):
+            self._status(f"grasp release point unavailable: {service_name}", warn=True)
+            return False
+        request = SetParameters.Request()
+        request.parameters = [
+            RosParameter(
+                name="release_point",
+                value=ParameterValue(
+                    type=ParameterType.PARAMETER_STRING,
+                    string_value=release_point,
+                ),
+            )
+        ]
+        future = client.call_async(request)
+        if not self._wait_service_future(future, 2.0):
+            self._status(f"grasp release point timeout: {service_name}", warn=True)
+            return False
+        response = future.result()
+        results = response.results if response is not None else []
+        if not results or not bool(results[0].successful):
+            reason = results[0].reason if results else "empty response"
+            self._status(f"grasp release point rejected: {reason}", warn=True)
+            return False
+        self._status(f"grasp release point: {release_point}")
+        return True
+
+    def _call_cleanup_task_worker(self, command: str) -> None:
+        client = self.cleanup_task_clients.get(command)
+        if client is None:
+            self._status(f"road cleanup service missing: {command}", warn=True)
+            return
+        if command == "start":
+            self.drive_base_manual("stop")
+            self.stop_arm_velocity_hold()
+            if self._aubo_teach_gate_may_be_active():
+                self._publish_aubo_teach_command("teach_off")
+                ready = self.aubo_teach_ready_event.wait(
+                    max(float(self.get_parameter("aubo_teach_exit_wait_sec").value), 0.0)
+                )
+                if not ready or self._aubo_teach_gate_may_be_active():
+                    self._status("road cleanup blocked: Aubo teach mode still active", warn=True)
+                    return
+            self.start_camera_stack()
+            self._start_managed_process_worker("grasp_server")
+            self._start_managed_process_worker("cleanup_server")
+            self._status("road cleanup: waiting for server startup")
+        elif command in {"pause", "return_home", "stop"}:
+            self.drive_base_manual("stop")
+            self.stop_arm_velocity_hold()
+
+        service_name = getattr(client, "srv_name", command)
+        self._status(f"road cleanup {command} requested")
+        wait_timeout = 75.0 if command == "start" else 4.0
+        if not client.wait_for_service(timeout_sec=wait_timeout):
+            self._status(f"road cleanup {command} unavailable: {service_name}", warn=True)
+            return
+        future = client.call_async(Trigger.Request())
+        response_timeout = 12.0 if command == "return_home" else 8.0
+        if not self._wait_service_future(future, response_timeout):
+            self._status(f"road cleanup {command} timeout: {service_name}", warn=True)
+            return
+        response = future.result()
+        success = bool(response.success) if response is not None else False
+        message = response.message if response is not None else "empty response"
+        self._status(
+            f"road cleanup {command} {'ok' if success else 'failed'}: "
+            f"{self._short_grasp_task_message(message)}",
+            warn=not success,
+        )
+
+    def _call_step_cleanup_worker(self, command: str) -> None:
+        client = self.step_cleanup_clients.get(command)
+        if client is None:
+            self._status(f"step cleanup service missing: {command}", warn=True)
+            return
+        if command == "start":
+            self.drive_base_manual("stop")
+            self.stop_arm_velocity_hold()
+            if self._aubo_teach_gate_may_be_active():
+                self._publish_aubo_teach_command("teach_off")
+                ready = self.aubo_teach_ready_event.wait(
+                    max(float(self.get_parameter("aubo_teach_exit_wait_sec").value), 0.0)
+                )
+                if not ready or self._aubo_teach_gate_may_be_active():
+                    self._status("step cleanup blocked: Aubo teach mode still active", warn=True)
+                    return
+            self.start_camera_stack()
+            self._start_managed_process_worker("grasp_server")
+            self._start_managed_process_worker("step_cleanup_server")
+            self._status("step cleanup: waiting for server startup")
+        elif command == "stop":
+            self.drive_base_manual("stop")
+            self.stop_arm_velocity_hold()
+
+        service_name = getattr(client, "srv_name", command)
+        self._status(f"step cleanup {command} requested")
+        wait_timeout = 30.0 if command == "start" else 4.0
+        if not client.wait_for_service(timeout_sec=wait_timeout):
+            self._status(f"step cleanup {command} unavailable: {service_name}", warn=True)
+            return
+        future = client.call_async(Trigger.Request())
+        if not self._wait_service_future(future, 8.0):
+            self._status(f"step cleanup {command} timeout: {service_name}", warn=True)
+            return
+        response = future.result()
+        success = bool(response.success) if response is not None else False
+        message = response.message if response is not None else "empty response"
+        self._status(
+            f"step cleanup {command} {'ok' if success else 'failed'}: "
             f"{self._short_grasp_task_message(message)}",
             warn=not success,
         )
@@ -1710,6 +2242,17 @@ class TeachPanelNode(Node):
         signed_distance = linear_x * duration
         signed_angle = angular_z * duration
 
+        if abs(linear_x) > 1e-9 and abs(angular_z) > 1e-9:
+            return {
+                "type": "timed",
+                "action": command,
+                "duration_sec": float(duration),
+                "linear_x": linear_x,
+                "angular_z": angular_z,
+                "source": "timed",
+                "start_stamp": active.get("start_stamp", ""),
+            }
+
         if len(start_pose) == 3 and len(end_pose) == 3:
             dx = float(end_pose[0]) - float(start_pose[0])
             dy = float(end_pose[1]) - float(start_pose[1])
@@ -1767,7 +2310,11 @@ class TeachPanelNode(Node):
         if segment.get("type") == "angular":
             angle = math.degrees(float(segment.get("angle_rad", 0.0)))
             return f"base recorded: {action} {angle:.1f} deg"
-        return f"base recorded: {action} {float(segment.get('duration_sec', 0.0)):.1f} s"
+        return (
+            f"base recorded: {action} vx={float(segment.get('linear_x', 0.0)):.3f} "
+            f"wz={float(segment.get('angular_z', 0.0)):.3f} "
+            f"t={float(segment.get('duration_sec', 0.0)):.1f} s"
+        )
 
     def _jog_arm_worker(self, axis: str, sign: float) -> None:
         q_start = self._current_arm_vector()
@@ -2059,7 +2606,28 @@ class TeachPanelNode(Node):
         self._status(f"recorded wait {clean_label}: {wait_sec:.1f}s")
         return waypoint
 
-    def replay(self, waypoints: list[TeachWaypoint]) -> None:
+    def record_visual_grasp(self, label: str, release_point: str = "basket_a") -> TeachWaypoint:
+        clean_label = label.strip() or f"visual_grasp_{datetime.now().strftime('%H%M%S')}"
+        release_point = str(release_point).strip().lower()
+        if release_point not in {"basket_a", "basket_b"}:
+            raise ValueError(f"unknown release point: {release_point}")
+        waypoint = TeachWaypoint(
+            label=clean_label,
+            stamp=datetime.now().isoformat(timespec="seconds"),
+            kind="visual_grasp",
+            task_command=f"start:{release_point}",
+        )
+        self._status(f"recorded visual grasp {clean_label}: {release_point}")
+        return waypoint
+
+    def replay(
+        self,
+        waypoints: list[TeachWaypoint],
+        *,
+        replay_arm: bool = True,
+        replay_gripper: bool = True,
+        progress_callback: Callable[[int | None, int, str, str], None] | None = None,
+    ) -> None:
         if not waypoints:
             self._status("replay skipped: no waypoints", warn=True)
             return
@@ -2070,31 +2638,72 @@ class TeachPanelNode(Node):
         self.cancel_event.clear()
         self.replay_thread = threading.Thread(
             target=self._replay_worker,
-            args=([TeachWaypoint(**asdict(item)) for item in waypoints],),
+            args=(
+                [TeachWaypoint(**asdict(item)) for item in waypoints],
+                bool(replay_arm),
+                bool(replay_gripper),
+                progress_callback,
+            ),
             daemon=True,
         )
         self.replay_thread.start()
 
-    def _replay_worker(self, waypoints: list[TeachWaypoint]) -> None:
-        self._status(f"replay started: {len(waypoints)} waypoints")
+    def _notify_replay_progress(
+        self,
+        progress_callback: Callable[[int | None, int, str, str], None] | None,
+        index: int | None,
+        total: int,
+        label: str,
+        state: str,
+    ) -> None:
+        if progress_callback is None:
+            return
         try:
-            if self._replay_has_arm_targets(waypoints) and not self._ensure_aubo_motion_ready():
+            progress_callback(index, total, label, state)
+        except Exception as exc:
+            self.get_logger().warning(f"replay progress callback failed: {exc}")
+
+    def _replay_worker(
+        self,
+        waypoints: list[TeachWaypoint],
+        replay_arm: bool,
+        replay_gripper_enabled: bool,
+        progress_callback: Callable[[int | None, int, str, str], None] | None,
+    ) -> None:
+        total = len(waypoints)
+        mode = "" if replay_arm or replay_gripper_enabled else " (base only)"
+        self._status(f"replay started: {total} waypoints{mode}")
+        try:
+            if (
+                replay_arm
+                and self._replay_has_arm_targets(waypoints)
+                and not self._ensure_aubo_motion_ready()
+            ):
                 raise RuntimeError("Aubo teach mode is still active")
             replay_gripper = self.gripper_state
             previous_arm_joints: list[float] | None = None
             for index, waypoint in enumerate(waypoints, start=1):
                 if self.cancel_event.is_set():
                     break
-                self._status(f"replay {index}/{len(waypoints)}: {waypoint.label}")
+                self._notify_replay_progress(
+                    progress_callback, index, total, waypoint.label, "running"
+                )
+                self._status(f"replay {index}/{total}: {waypoint.label}")
                 if waypoint.kind == "wait":
                     self.set_base_velocity(0.0, 0.0)
                     self._status(f"wait {waypoint.wait_sec:.1f}s: {waypoint.label}")
                     self._sleep(float(waypoint.wait_sec))
                     continue
+                if waypoint.kind == "visual_grasp":
+                    if not replay_arm and not replay_gripper_enabled:
+                        self._status(f"visual grasp skipped in base-only replay: {waypoint.label}")
+                        continue
+                    self._replay_visual_grasp_step(waypoint)
+                    continue
 
                 if waypoint.base_motion:
                     self._replay_base_motion(waypoint.base_motion, waypoint.label)
-                if self._valid_arm_target(waypoint.arm_joints):
+                if replay_arm and self._valid_arm_target(waypoint.arm_joints):
                     if previous_arm_joints is None:
                         previous_arm_joints = self._current_arm_vector()
                     if previous_arm_joints is None:
@@ -2115,12 +2724,16 @@ class TeachPanelNode(Node):
                             f"arm replay skipped: unchanged target for {waypoint.label}"
                         )
                     previous_arm_joints = target_arm_joints
-                elif waypoint.arm_joints:
+                elif replay_arm and waypoint.arm_joints:
                     self._status(
                         f"arm replay skipped: invalid joint target for {waypoint.label}",
                         warn=True,
                     )
-                if waypoint.gripper in ("open", "close") and waypoint.gripper != replay_gripper:
+                if (
+                    replay_gripper_enabled
+                    and _is_replay_gripper_command(waypoint.gripper)
+                    and waypoint.gripper != replay_gripper
+                ):
                     self.publish_gripper(waypoint.gripper)
                     replay_gripper = waypoint.gripper
                     gripper_wait = max(float(self.get_parameter("gripper_settle_sec").value), 0.0)
@@ -2129,10 +2742,102 @@ class TeachPanelNode(Node):
                         self._sleep(gripper_wait)
                 self._sleep(float(self.get_parameter("replay_settle_sec").value))
             self.set_base_velocity(0.0, 0.0)
-            self._status("replay complete" if not self.cancel_event.is_set() else "replay stopped")
+            state = "stopped" if self.cancel_event.is_set() else "complete"
+            self._notify_replay_progress(progress_callback, None, total, "", state)
+            self._status("replay complete" if state == "complete" else "replay stopped")
         except Exception as exc:
             self.set_base_velocity(0.0, 0.0)
+            if "visual grasp" in str(exc).lower():
+                self._call_grasp_task_worker("stop")
+            self._notify_replay_progress(progress_callback, None, total, str(exc), "failed")
             self._status(f"replay failed: {exc}", warn=True)
+
+    def _replay_visual_grasp_step(self, waypoint: TeachWaypoint) -> None:
+        command_text = str(waypoint.task_command or "start").strip().lower()
+        command, _, release_point = command_text.partition(":")
+        release_point = release_point or None
+        if command != "start":
+            raise RuntimeError(f"visual grasp unsupported command: {command}")
+        if release_point not in (None, "basket_a", "basket_b"):
+            raise RuntimeError(f"visual grasp unsupported release point: {release_point}")
+        previous_task_id = self._grasp_task_status_task_id()
+        self.set_base_velocity(0.0, 0.0)
+        self.drive_base_manual("stop")
+        self.stop_arm_velocity_hold()
+        self._status(f"visual grasp replay start: {waypoint.label} {release_point or 'basket_a'}")
+        if not self._visual_grasp_start_worker(release_point):
+            raise RuntimeError("visual grasp start failed")
+        ok, message = self._wait_visual_grasp_replay_done(waypoint.label, previous_task_id)
+        if not ok:
+            raise RuntimeError(f"visual grasp failed: {message}")
+
+    def _grasp_task_status_task_id(self) -> str:
+        client = self.grasp_task_clients.get("status")
+        if client is None or not client.wait_for_service(timeout_sec=0.2):
+            return ""
+        future = client.call_async(Trigger.Request())
+        if not self._wait_service_future(future, 0.5):
+            return ""
+        response = future.result()
+        if response is None or not bool(response.success):
+            return ""
+        try:
+            payload = json.loads(str(response.message))
+        except json.JSONDecodeError:
+            return ""
+        return str(payload.get("task_id", "")).strip()
+
+    def _wait_visual_grasp_replay_done(
+        self, label: str, previous_task_id: str = ""
+    ) -> tuple[bool, str]:
+        client = self.grasp_task_clients.get("status")
+        if client is None:
+            return False, "missing grasp task status client"
+        service_name = getattr(client, "srv_name", "status")
+        if not client.wait_for_service(timeout_sec=1.5):
+            return False, f"grasp task status unavailable: {service_name}"
+        timeout = max(float(self.get_parameter("visual_grasp_replay_timeout_sec").value), 0.0)
+        poll = max(float(self.get_parameter("visual_grasp_replay_poll_sec").value), 0.1)
+        deadline = time.monotonic() + timeout
+        last_message = "no status"
+        while time.monotonic() < deadline and not self.cancel_event.is_set():
+            future = client.call_async(Trigger.Request())
+            if not self._wait_service_future(future, min(poll, 2.0)):
+                last_message = f"status timeout: {service_name}"
+                self._sleep(poll)
+                continue
+            response = future.result()
+            if response is None or not bool(response.success):
+                last_message = "empty status response" if response is None else response.message
+                self._sleep(poll)
+                continue
+            try:
+                payload = json.loads(str(response.message))
+            except json.JSONDecodeError:
+                last_message = str(response.message)
+                self._sleep(poll)
+                continue
+            state = str(payload.get("state", "")).strip().lower()
+            task_id = str(payload.get("task_id", "")).strip()
+            last_message = self._short_grasp_task_message(response.message)
+            if previous_task_id and task_id == previous_task_id and state in {
+                "succeeded",
+                "failed",
+                "canceled",
+            }:
+                self._sleep(poll)
+                continue
+            if state == "succeeded":
+                self._status(f"visual grasp replay complete: {label}")
+                return True, last_message
+            if state in {"failed", "canceled"}:
+                return False, last_message
+            self._sleep(poll)
+        if self.cancel_event.is_set():
+            self._call_grasp_task_worker("stop")
+            return False, "visual grasp canceled"
+        self._call_grasp_task_worker("stop")
+        return False, f"visual grasp timeout: {last_message}"
 
     def _replay_has_arm_targets(self, waypoints: list[TeachWaypoint]) -> bool:
         return any(
@@ -2164,10 +2869,21 @@ class TeachPanelNode(Node):
 
     def _replay_base_motion(self, segments: list[dict], label: str) -> None:
         max_duration = float(self.get_parameter("base_motion_max_segment_sec").value)
-        for index, segment in enumerate(segments, start=1):
+        normalized_segments = [self._normalize_base_motion_segment(segment) for segment in segments]
+        if self._should_replay_base_curve(normalized_segments):
+            self._status(f"base curve motion for {label}: segments={len(normalized_segments)}")
+            try:
+                self._current_base_pose()
+            except Exception as exc:
+                self._status(f"base curve fallback for {label}: {exc}", warn=True)
+            else:
+                if not self._replay_base_curve_motion(normalized_segments):
+                    self._status(f"base curve incomplete for {label}", warn=True)
+                return
+
+        for index, normalized in enumerate(normalized_segments, start=1):
             if self.cancel_event.is_set():
                 break
-            normalized = self._normalize_base_motion_segment(segment)
             motion_type = normalized.get("type")
             if motion_type == "linear":
                 distance = float(normalized.get("signed_distance_m", 0.0))
@@ -2201,6 +2917,86 @@ class TeachPanelNode(Node):
                     time.sleep(0.05)
             self.set_base_velocity(0.0, 0.0)
             self._sleep(0.1)
+
+    def _should_replay_base_curve(self, segments: list[dict]) -> bool:
+        if not bool(self.get_parameter("base_curve_replay_enabled").value):
+            return False
+        min_turn = abs(float(self.get_parameter("base_curve_min_turn_angle_rad").value))
+        return any(
+            segment.get("type") == "angular"
+            and abs(float(segment.get("signed_angle_rad", 0.0))) >= min_turn
+            for segment in segments
+        )
+
+    def _replay_base_curve_motion(self, segments: list[dict]) -> bool:
+        linear_limit = abs(float(self.get_parameter("base_curve_max_linear_speed").value))
+        angular_limit = abs(float(self.get_parameter("base_curve_max_angular_speed").value))
+        if linear_limit <= 0.0:
+            linear_limit = abs(float(self.get_parameter("base_replay_linear_speed").value))
+        if angular_limit <= 0.0:
+            angular_limit = abs(float(self.get_parameter("base_replay_angular_speed").value))
+        rate = max(float(self.get_parameter("base_curve_publish_rate").value), 1.0)
+        period = 1.0 / rate
+        max_duration = float(self.get_parameter("base_motion_max_segment_sec").value)
+
+        commands: list[tuple[float, float, float]] = []
+        index = 0
+        while index < len(segments):
+            segment = segments[index]
+            next_segment = segments[index + 1] if index + 1 < len(segments) else {}
+            if segment.get("type") == "angular" and next_segment.get("type") == "linear":
+                angle = float(segment.get("signed_angle_rad", 0.0))
+                distance = float(next_segment.get("signed_distance_m", 0.0))
+                recorded_duration = max(float(segment.get("duration_sec", 0.0)), 0.0) + max(
+                    float(next_segment.get("duration_sec", 0.0)), 0.0
+                )
+                index += 2
+            elif segment.get("type") == "linear":
+                distance = float(segment.get("signed_distance_m", 0.0))
+                angle = 0.0
+                recorded_duration = max(float(segment.get("duration_sec", 0.0)), 0.0)
+                index += 1
+            elif segment.get("type") == "angular":
+                distance = 0.0
+                angle = float(segment.get("signed_angle_rad", 0.0))
+                recorded_duration = max(float(segment.get("duration_sec", 0.0)), 0.0)
+                index += 1
+            else:
+                commands.append(
+                    (
+                        float(segment.get("linear_x", 0.0)),
+                        float(segment.get("angular_z", 0.0)),
+                        max(0.0, min(float(segment.get("duration_sec", 0.0)), max_duration)),
+                    )
+                )
+                index += 1
+                continue
+
+            if abs(distance) < 1e-6 and abs(angle) < 1e-6:
+                continue
+            duration = max(
+                recorded_duration,
+                abs(distance) / max(linear_limit, 1e-3),
+                abs(angle) / max(angular_limit, 1e-3),
+                0.3,
+            )
+            commands.append((distance / duration, angle / duration, min(duration, max_duration)))
+
+        if not commands:
+            return False
+
+        try:
+            for linear_x, angular_z, duration in commands:
+                deadline = time.monotonic() + duration
+                twist = Twist()
+                twist.linear.x = float(np.clip(linear_x, -linear_limit, linear_limit))
+                twist.angular.z = float(np.clip(angular_z, -angular_limit, angular_limit))
+                while not self.cancel_event.is_set() and time.monotonic() < deadline:
+                    self.cmd_vel_pub.publish(twist)
+                    time.sleep(period)
+            return not self.cancel_event.is_set()
+        finally:
+            self.set_base_velocity(0.0, 0.0)
 
     def _normalize_base_motion_segment(self, segment: dict) -> dict:
         if segment.get("type") == "linear":
@@ -2811,6 +3607,8 @@ class TeachPanelNode(Node):
             return list(vector) if vector is not None else None
 
     def _current_arm_vector_locked(self) -> list[float] | None:
+        if not self._aubo_reachable_locked():
+            return None
         if not all(name in self.current_arm for name in self.arm_state_joint_names):
             return None
         return [self.current_arm[name] for name in self.arm_state_joint_names]
@@ -2843,6 +3641,7 @@ class TeachPanelNode(Node):
 
         def delayed_viewer() -> None:
             time.sleep(0.8)
+            self.start_managed_process("depth_pointcloud")
             self.start_managed_process("viewer")
 
         self._start_worker(delayed_viewer)
@@ -2880,6 +3679,13 @@ class TeachPanelNode(Node):
         if already_message:
             self._status(already_message)
             return
+        ready_services = MANAGED_SERVICE_READY_SERVICES.get(name, ())
+        ready_topic = MANAGED_SERVICE_READY_TOPICS.get(name, "")
+        if ready_services and self._services_exist(ready_services) and self._topic_has_publisher(ready_topic):
+            self._status(f"service {name} already available")
+            with self.lock:
+                self.hardware_status[f"Svc:{name}"] = "external"
+            return
 
         log_path = self.runtime_log_dir / f"{name}.log"
         shell_command = "\n".join(
@@ -2887,9 +3693,7 @@ class TeachPanelNode(Node):
                 "set -euo pipefail",
                 f"cd {shlex.quote(str(self.workspace_root))}",
                 "set +u",
-                "source scripts/env/arachne_env.sh",
                 "[[ -f install/setup.bash ]] && source install/setup.bash",
-                "[[ -f scripts/env/arachne_real_defaults.sh ]] && source scripts/env/arachne_real_defaults.sh",
                 "set -u",
                 f"exec {command}",
             ]
@@ -2936,6 +3740,13 @@ class TeachPanelNode(Node):
             pid=process.pid,
         )
         self._status(f"service {name} started pid={process.pid}; log={log_path}")
+
+    def _services_exist(self, service_names: tuple[str, ...]) -> bool:
+        available = {name for name, _types in self.get_service_names_and_types()}
+        return all(name in available for name in service_names)
+
+    def _topic_has_publisher(self, topic_name: str) -> bool:
+        return bool(topic_name and self.get_publishers_info_by_topic(topic_name))
 
     def _stop_managed_process_worker(self, name: str, *, quiet: bool = False) -> None:
         timeout_sec = max(float(self.get_parameter("service_stop_timeout_sec").value), 0.5)
@@ -3086,6 +3897,8 @@ class TeachPanelNode(Node):
         arm_joint_step_deg: float,
         arm_hold_period_sec: float,
         waypoint_duration_sec: float,
+        arm_speed_rad_sec: float,
+        arm_accel_rad_sec2: float,
         gripper_settle_sec: float,
         arm_home_joints_deg: str,
         arm_install_joints_deg: str,
@@ -3100,6 +3913,10 @@ class TeachPanelNode(Node):
             raise ValueError("hold period must be positive")
         if waypoint_duration_sec <= 0.0:
             raise ValueError("waypoint duration must be positive")
+        if arm_speed_rad_sec <= 0.0:
+            raise ValueError("arm speed must be positive")
+        if arm_accel_rad_sec2 <= 0.0:
+            raise ValueError("arm accel must be positive")
         if gripper_settle_sec < 0.0:
             raise ValueError("gripper settle must be non-negative")
         home_values = _parse_joint_degrees(arm_home_joints_deg, label="home joints")
@@ -3130,6 +3947,21 @@ class TeachPanelNode(Node):
                     float(waypoint_duration_sec),
                 ),
                 Parameter(
+                    "aubo_sdk_move_speed_rad_sec",
+                    Parameter.Type.DOUBLE,
+                    float(arm_speed_rad_sec),
+                ),
+                Parameter(
+                    "arm_velocity_max_joint_speed_rad_sec",
+                    Parameter.Type.DOUBLE,
+                    float(arm_speed_rad_sec),
+                ),
+                Parameter(
+                    "aubo_sdk_move_accel_rad_sec2",
+                    Parameter.Type.DOUBLE,
+                    float(arm_accel_rad_sec2),
+                ),
+                Parameter(
                     "gripper_settle_sec",
                     Parameter.Type.DOUBLE,
                     float(gripper_settle_sec),
@@ -3150,7 +3982,8 @@ class TeachPanelNode(Node):
             "motion settings applied: "
             f"base={base_linear_speed:.3f}m/s {base_angular_speed:.3f}rad/s, "
             f"tcp={arm_jog_step_m:.3f}m, rot={arm_rotate_step_deg:.1f}deg, "
-            f"joint={arm_joint_step_deg:.1f}deg, hold={arm_hold_period_sec:.2f}s, "
+            f"joint={arm_joint_step_deg:.1f}deg, speed={arm_speed_rad_sec:.2f}rad/s, "
+            f"accel={arm_accel_rad_sec2:.2f}rad/s2, hold={arm_hold_period_sec:.2f}s, "
             f"gripper_settle={gripper_settle_sec:.1f}s"
         )
 
@@ -3176,16 +4009,27 @@ class TeachPanelApp:
         self.waypoints: list[TeachWaypoint] = []
         self.root = tk.Tk()
         self.root.title("Arachne Scope")
-        self.root.geometry("1100x720")
-        self.root.minsize(820, 520)
+        self.root.geometry("1180x760")
+        self.root.minsize(760, 520)
         self.status_vars: dict[str, tk.StringVar] = {}
         self.label_var = tk.StringVar(value="wp_1")
         self.wait_var = tk.StringVar(value="2.0")
         self.file_var = tk.StringVar(value="unsaved")
         self.program_var = tk.StringVar(value="0 nodes")
+        self.replay_current_var = tk.StringVar(value="Current: -")
+        self.demo_file_var = tk.StringVar(value=DEFAULT_DEMO_RECORDING_PATH)
+        self.demo_stats_var = tk.StringVar(value=self._demo_stats_text())
         self.base_linear_var = tk.StringVar(value=f"{float(node.get_parameter('base_linear_speed').value):.3f}")
         self.base_angular_var = tk.StringVar(
             value=f"{float(node.get_parameter('base_angular_speed').value):.3f}"
+        )
+        self.base_distance_var = tk.StringVar(value="0.20")
+        self.base_angle_var = tk.StringVar(value="30")
+        self.base_target_linear_speed_var = tk.StringVar(
+            value=f"{float(node.get_parameter('base_replay_linear_speed').value):.3f}"
+        )
+        self.base_target_angular_speed_var = tk.StringVar(
+            value=f"{float(node.get_parameter('base_replay_angular_speed').value):.3f}"
         )
         self.arm_step_var = tk.StringVar(value=f"{float(node.get_parameter('arm_jog_step_m').value):.3f}")
         self.arm_rotate_var = tk.StringVar(
@@ -3200,9 +4044,17 @@ class TeachPanelApp:
         self.waypoint_duration_var = tk.StringVar(
             value=f"{float(node.get_parameter('arm_waypoint_duration_sec').value):.2f}"
         )
+        self.arm_speed_var = tk.StringVar(
+            value=f"{float(node.get_parameter('aubo_sdk_move_speed_rad_sec').value):.2f}"
+        )
+        self.arm_accel_var = tk.StringVar(
+            value=f"{float(node.get_parameter('aubo_sdk_move_accel_rad_sec2').value):.2f}"
+        )
         self.gripper_settle_var = tk.StringVar(
             value=f"{float(node.get_parameter('gripper_settle_sec').value):.1f}"
         )
+        self.gripper_custom_var = tk.StringVar(value="12000")
+        self.visual_grasp_release_var = tk.StringVar(value="basket_a")
         self.home_joints_var = tk.StringVar(
             value=str(node.get_parameter("arm_home_joints_deg").value)
         )
@@ -3212,6 +4064,8 @@ class TeachPanelApp:
         self.config_path_var = tk.StringVar(
             value=str(node.get_parameter("teach_config_path").value)
         )
+        self.base_only_run_var = tk.BooleanVar(value=False)
+        self.hide_program_tree_var = tk.BooleanVar(value=False)
         self.joint_target_vars = [tk.StringVar(value="") for _ in range(6)]
         self.tool_target_vars = {axis: tk.StringVar(value="") for axis in ("x", "y", "z")}
         self.move_status_vars: dict[str, tk.StringVar] = {}
@@ -3223,15 +4077,22 @@ class TeachPanelApp:
         self._arm_hold_stream_active = False
         self._preset_hold_after: str | None = None
         self._preset_hold_active = False
+        self._scroll_widgets: dict[tk.Widget, tk.Canvas] = {}
         self.program_record_buttons: list[ttk.Button] = []
         self.listbox: tk.Listbox | None = None
+        self.program_tree_frame: ttk.LabelFrame | None = None
         self.log_text: tk.Text | None = None
         self.joint_tree: ttk.Treeview | None = None
         self._build()
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel, add=True)
+        self.root.bind_all("<Button-4>", self._on_mousewheel, add=True)
+        self.root.bind_all("<Button-5>", self._on_mousewheel, add=True)
         self.root.bind_all("<ButtonRelease-1>", lambda _event: self._arm_hold_release(), add=True)
         self.root.bind("<FocusOut>", lambda _event: self._arm_hold_release(), add=True)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self._refresh()
+        self.root.after(600, self._raise_window)
+        self.root.after(4500, self._raise_window)
 
     def _build(self) -> None:
         style = ttk.Style(self.root)
@@ -3244,6 +4105,8 @@ class TeachPanelApp:
         style.configure("Top.TLabel", background="#202833", foreground="#f6f8fb")
         style.configure("State.TLabel", font=("TkDefaultFont", 10, "bold"))
         style.configure("Danger.TButton", foreground="#8a1f11")
+        style.configure("Primary.TButton", foreground="#0f4c81")
+        style.configure("Service.TButton", foreground="#245b2a")
 
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
@@ -3253,6 +4116,7 @@ class TeachPanelApp:
         self.notebook.grid(row=1, column=0, sticky="nsew")
         self._build_home_tab()
         self._build_move_tab()
+        self._build_demo_tab()
         self._build_program_tab()
         self._build_config_tab()
         self._build_log_tab()
@@ -3261,7 +4125,18 @@ class TeachPanelApp:
         self._arm_hold_release()
         self._preset_hold_release()
         self.node.hold_arm_current()
+        self.node.stop_all_managed_processes()
         self.root.destroy()
+
+    def _raise_window(self) -> None:
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(500, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+        except tk.TclError:
+            pass
 
     def _add_scrollable_tab(self, title: str) -> ttk.Frame:
         outer = ttk.Frame(self.notebook)
@@ -3284,74 +4159,71 @@ class TeachPanelApp:
         def resize_content(event) -> None:
             canvas.itemconfigure(window_id, width=event.width)
 
-        def mousewheel(event) -> None:
-            if event.num == 4:
-                canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                canvas.yview_scroll(1, "units")
-            else:
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
         content.bind("<Configure>", refresh_scrollregion)
         canvas.bind("<Configure>", resize_content)
-        for widget in (canvas, content):
-            widget.bind("<MouseWheel>", mousewheel, add=True)
-            widget.bind("<Button-4>", mousewheel, add=True)
-            widget.bind("<Button-5>", mousewheel, add=True)
+        self._scroll_widgets[outer] = canvas
+        self._scroll_widgets[canvas] = canvas
+        self._scroll_widgets[content] = canvas
         return content
+
+    def _on_mousewheel(self, event) -> str | None:
+        widget = event.widget
+        canvas = None
+        while widget is not None:
+            canvas = self._scroll_widgets.get(widget)
+            if canvas is not None:
+                break
+            widget = getattr(widget, "master", None)
+        if canvas is None:
+            return None
+        if event.num == 4:
+            canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            canvas.yview_scroll(3, "units")
+        else:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _build_button_group(
+        self,
+        parent: ttk.Frame,
+        title: str,
+        buttons: tuple[tuple[str, Any, str | None], ...],
+        *,
+        columns: int = 2,
+    ) -> ttk.LabelFrame:
+        frame = ttk.LabelFrame(parent, text=title)
+        for column in range(columns):
+            frame.columnconfigure(column, weight=1)
+        for index, (text, command, style_name) in enumerate(buttons):
+            button = ttk.Button(frame, text=text, command=command)
+            if style_name:
+                button.configure(style=style_name)
+            if text == "Program Rec":
+                self.program_record_buttons.append(button)
+            button.grid(
+                row=index // columns,
+                column=index % columns,
+                sticky="ew",
+                padx=5,
+                pady=4,
+            )
+        return frame
 
     def _build_top_bar(self) -> None:
         top = ttk.Frame(self.root, style="Top.TFrame", padding=(12, 8))
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(5, weight=1)
+        top.columnconfigure(1, weight=1)
         ttk.Label(top, text="Arachne Scope", style="TopTitle.TLabel").grid(
-            row=0, column=0, rowspan=2, sticky="w", padx=(0, 18)
+            row=0, column=0, sticky="w", padx=(0, 14)
         )
-        for column, key in enumerate(("Aubo", "Base", "Gripper", "Grasp"), start=1):
-            var = tk.StringVar(value="waiting")
-            self.status_vars[key] = var
-            ttk.Label(top, text=key, style="Top.TLabel").grid(row=0, column=column, sticky="w", padx=8)
-            ttk.Label(top, textvariable=var, style="Top.TLabel", width=16).grid(
-                row=1, column=column, sticky="w", padx=8
-            )
         status_var = tk.StringVar(value="ready")
         self.status_vars["status"] = status_var
         ttk.Label(top, textvariable=status_var, style="Top.TLabel").grid(
-            row=0, column=5, rowspan=2, sticky="ew", padx=(16, 8)
+            row=0, column=1, sticky="ew", padx=(0, 8)
         )
-        self._make_preset_hold_button(top, "Home", "home").grid(row=0, column=6, rowspan=2, padx=4)
-        self._make_preset_hold_button(top, "Install", "install").grid(
-            row=0, column=7, rowspan=2, padx=4
-        )
-        ttk.Button(top, text="Run", command=self._play).grid(row=0, column=8, rowspan=2, padx=4)
-        self.program_record_button = ttk.Button(
-            top, text="Program Rec Off", command=self._toggle_program_recording
-        )
-        self.program_record_buttons.append(self.program_record_button)
-        self.program_record_button.grid(row=0, column=9, rowspan=2, padx=4)
-        ttk.Button(top, text="Stop", command=self.node.stop_all, style="Danger.TButton").grid(
-            row=0, column=10, rowspan=2, padx=4
-        )
-        ttk.Button(top, text="Visual Grasp", command=self.node.visual_grasp_start).grid(
-            row=0, column=11, rowspan=2, padx=4
-        )
-        ttk.Button(
-            top,
-            text="G Stop",
-            command=lambda: self.node.call_grasp_task("stop"),
-            style="Danger.TButton",
-        ).grid(row=0, column=12, rowspan=2, padx=4)
-        ttk.Button(top, text="Restore", command=lambda: self.node.call_grasp_task("restore")).grid(
-            row=0, column=13, rowspan=2, padx=4
-        )
-        ttk.Button(top, text="Aubo On", command=lambda: self.node.command_aubo_lifecycle("power_on")).grid(
-            row=0, column=14, rowspan=2, padx=4
-        )
-        ttk.Button(top, text="Aubo Start", command=lambda: self.node.command_aubo_lifecycle("startup")).grid(
-            row=0, column=15, rowspan=2, padx=4
-        )
-        ttk.Button(top, text="Aubo Off", command=self._confirm_aubo_power_off, style="Danger.TButton").grid(
-            row=0, column=16, rowspan=2, padx=4
+        ttk.Button(top, text="E-Stop", command=self.node.stop_all, style="Danger.TButton").grid(
+            row=0, column=2, padx=4
         )
 
     def _confirm_aubo_power_off(self) -> None:
@@ -3365,88 +4237,176 @@ class TeachPanelApp:
     def _build_home_tab(self) -> None:
         tab = self._add_scrollable_tab("Home")
         tab.columnconfigure(0, weight=1)
-        tab.columnconfigure(1, weight=1)
         tab.rowconfigure(1, weight=1)
 
-        overview = ttk.LabelFrame(tab, text="Robot Status")
-        overview.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        header = ttk.Frame(tab)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+
+        overview = ttk.LabelFrame(header, text="Robot Status")
+        overview.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         overview.columnconfigure(1, weight=1)
-        for row, key in enumerate(
-            (
-                "base",
-                "tool",
-                "arm",
-                "gripper",
-                "teach",
-                "grasp_task",
-                "camera",
-                "viewer",
-                "slam",
-                "grasp_server",
-                "program",
-                "log_dir",
-            )
-        ):
-            ttk.Label(overview, text=key, style="State.TLabel", width=10).grid(
-                row=row, column=0, sticky="w", padx=6, pady=4
+        overview.columnconfigure(3, weight=1)
+        status_items = (
+            ("base", "base(odom)"),
+            ("tool_aubo", "tool(aubo)"),
+            ("tool_base", "tool(base)"),
+            ("arm", "arm"),
+            ("gripper", "gripper"),
+            ("teach", "teach"),
+            ("grasp_task", "grasp_task"),
+            ("road_cleanup", "road_cleanup"),
+            ("step_cleanup", "step_cleanup"),
+            ("camera", "camera"),
+            ("depth_pointcloud", "depth_cloud"),
+            ("viewer", "viewer"),
+            ("yolo_viewer", "yolo_view"),
+            ("slam", "slam"),
+            ("grasp_server", "grasp_server"),
+            ("cleanup_server", "cleanup_server"),
+            ("step_cleanup_server", "step_server"),
+            ("program", "program"),
+            ("log_dir", "log_dir"),
+        )
+        split_row = (len(status_items) + 1) // 2
+        for index, (key, label) in enumerate(status_items):
+            row = index % split_row
+            column = 0 if index < split_row else 2
+            ttk.Label(overview, text=label, style="State.TLabel", width=12).grid(
+                row=row, column=column, sticky="w", padx=6, pady=3
             )
             var = tk.StringVar(value="waiting")
             self.status_vars[key] = var
-            ttk.Label(overview, textvariable=var).grid(row=row, column=1, sticky="ew", padx=6, pady=4)
-
-        quick = ttk.LabelFrame(tab, text="Quick Control")
-        quick.grid(row=0, column=1, sticky="nsew", pady=(0, 8))
-        self._make_preset_hold_button(quick, "Hold Home", "home").grid(
-            row=0, column=0, sticky="ew", padx=5, pady=5
-        )
-        self._make_preset_hold_button(quick, "Hold Install", "install").grid(
-            row=0, column=1, sticky="ew", padx=5, pady=5
-        )
-        ttk.Button(quick, text="Stop All", command=self.node.stop_all).grid(
-            row=0, column=2, sticky="ew", padx=5, pady=5
-        )
-        buttons = (
-            ("Aubo On", lambda: self.node.command_aubo_lifecycle("power_on")),
-            ("Aubo Start", lambda: self.node.command_aubo_lifecycle("startup")),
-            ("Aubo Off", self._confirm_aubo_power_off),
-            ("Teach On", lambda: self.node.set_aubo_teach(True)),
-            ("Teach Off", lambda: self.node.set_aubo_teach(False)),
-            ("Set Home", self._set_home_from_current),
-            ("Set Install", self._set_install_from_current),
-            ("Program Rec", self._toggle_program_recording),
-            ("Record", self._record),
-            ("Replay", self._play),
-            ("Visual Grasp", self.node.visual_grasp_start),
-            ("Grasp Start", lambda: self.node.call_grasp_task("start")),
-            ("Grasp Stop", lambda: self.node.call_grasp_task("stop")),
-            ("Restore", lambda: self.node.call_grasp_task("restore")),
-            ("Camera", self.node.start_camera_stack),
-            ("2D View", lambda: self.node.toggle_managed_process("viewer")),
-            ("SLAM", lambda: self.node.toggle_managed_process("slam")),
-            ("GraspSrv", lambda: self.node.toggle_managed_process("grasp_server")),
-            ("Open", lambda: self.node.publish_gripper("open")),
-            ("Close", lambda: self.node.publish_gripper("close")),
-            ("Save Config", self._save_config),
-        )
-        for index, (text, command) in enumerate(buttons, start=3):
-            button = ttk.Button(quick, text=text, command=command)
-            if text == "Program Rec":
-                self.program_record_buttons.append(button)
-            button.grid(
-                row=index // 3, column=index % 3, sticky="ew", padx=5, pady=5
+            ttk.Label(overview, textvariable=var).grid(
+                row=row, column=column + 1, sticky="ew", padx=6, pady=3
             )
-        for column in range(3):
+
+        quick = ttk.Frame(header)
+        quick.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        for column in range(2):
             quick.columnconfigure(column, weight=1)
 
-        services = ttk.LabelFrame(tab, text="Runtime Services")
-        services.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        service_group = self._build_button_group(
+            quick,
+            "Runtime Services",
+            (
+                ("Camera + View", self.node.start_camera_stack, "Service.TButton"),
+                ("Grasp Services", self.node.visual_grasp_start, "Service.TButton"),
+                ("Road Preflight", lambda: self.node.call_cleanup_task("preflight"), None),
+                ("Depth Cloud", lambda: self.node.toggle_managed_process("depth_pointcloud"), None),
+                ("2D View", lambda: self.node.toggle_managed_process("viewer"), None),
+                ("YOLO Window", lambda: self.node.toggle_managed_process("yolo_viewer"), None),
+                ("Localize / Nav", lambda: self.node.toggle_managed_process("slam"), None),
+                ("Grasp Server", lambda: self.node.toggle_managed_process("grasp_server"), None),
+                ("Road Server", lambda: self.node.toggle_managed_process("cleanup_server"), None),
+                ("Step Server", lambda: self.node.toggle_managed_process("step_cleanup_server"), None),
+            ),
+            columns=2,
+        )
+        service_group.grid(row=1, column=0, sticky="new", padx=(0, 5), pady=(0, 8))
+
+        arm_group = self._build_button_group(
+            quick,
+            "Aubo Power / Teach",
+            (
+                ("Aubo On", lambda: self.node.command_aubo_lifecycle("power_on"), None),
+                ("Aubo Start", lambda: self.node.command_aubo_lifecycle("startup"), None),
+                ("Teach On", lambda: self.node.set_aubo_teach(True), None),
+                ("Teach Off", lambda: self.node.set_aubo_teach(False), None),
+                ("Aubo Off", self._confirm_aubo_power_off, "Danger.TButton"),
+            ),
+            columns=2,
+        )
+        arm_group.grid(row=1, column=1, sticky="new", padx=(5, 0), pady=(0, 8))
+
+        preset_group = ttk.LabelFrame(quick, text="Pose Presets")
+        preset_group.grid(row=2, column=0, sticky="new", padx=(0, 5), pady=(0, 8))
+        for column in range(2):
+            preset_group.columnconfigure(column, weight=1)
+        self._make_preset_hold_button(preset_group, "Hold Home", "home").grid(
+            row=0, column=0, sticky="ew", padx=5, pady=4
+        )
+        self._make_preset_hold_button(preset_group, "Hold Install", "install").grid(
+            row=0, column=1, sticky="ew", padx=5, pady=4
+        )
+        ttk.Button(preset_group, text="Set Home", command=self._set_home_from_current).grid(
+            row=1, column=0, sticky="ew", padx=5, pady=4
+        )
+        ttk.Button(preset_group, text="Set Install", command=self._set_install_from_current).grid(
+            row=1, column=1, sticky="ew", padx=5, pady=4
+        )
+        program_group = self._build_button_group(
+            quick,
+            "Program",
+            (
+                ("Program Rec", self._toggle_program_recording, None),
+                ("Record", self._record, None),
+                ("Replay", self._play, None),
+                ("Save Config", self._save_config, None),
+            ),
+            columns=2,
+        )
+        program_group.grid(row=2, column=1, sticky="new", padx=(5, 0), pady=(0, 8))
+
+        task_group = self._build_button_group(
+            quick,
+            "Task Actions",
+            (
+                ("Grasp A", lambda: self.node.call_grasp_task("start", "basket_a"), "Primary.TButton"),
+                ("Grasp B", lambda: self.node.call_grasp_task("start", "basket_b"), "Primary.TButton"),
+                ("Step Demo", lambda: self.node.call_step_cleanup("start"), None),
+                ("Road Start", lambda: self.node.call_cleanup_task("start"), None),
+                ("Return", lambda: self.node.call_cleanup_task("return_home"), None),
+                ("Task Stop", lambda: self.node.call_grasp_task("stop"), "Danger.TButton"),
+                ("Road Stop", lambda: self.node.call_cleanup_task("stop"), "Danger.TButton"),
+                ("Road Pause", lambda: self.node.call_cleanup_task("pause"), "Danger.TButton"),
+            ),
+            columns=2,
+        )
+        task_group.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+
+        gripper_group = self._build_button_group(
+            quick,
+            "Gripper",
+            (
+                ("Open", lambda: self.node.publish_gripper("open"), None),
+                ("Close", lambda: self.node.publish_gripper("close"), None),
+                *(
+                    (command, lambda value=command: self.node.publish_gripper(value), None)
+                    for command in GRIPPER_PRESET_COMMANDS
+                ),
+            ),
+            columns=2,
+        )
+        ttk.Entry(gripper_group, textvariable=self.gripper_custom_var, width=8).grid(
+            row=3, column=0, sticky="ew", padx=5, pady=4
+        )
+        ttk.Button(gripper_group, text="Set", command=self._publish_custom_gripper).grid(
+            row=3, column=1, sticky="ew", padx=5, pady=4
+        )
+        gripper_group.grid(row=4, column=0, columnspan=2, sticky="ew")
+
+        details = ttk.Notebook(tab)
+        details.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        details.rowconfigure(0, weight=1)
+        details.columnconfigure(0, weight=1)
+
+        services = ttk.Frame(details)
+        details.add(services, text="Runtime Services")
+        services.columnconfigure(0, weight=1)
         services.columnconfigure(1, weight=1)
+        services.columnconfigure(2, weight=1)
+        services.columnconfigure(3, weight=1)
         for row, (key, label) in enumerate(
             (
                 ("camera", "Gemini Camera"),
+                ("depth_pointcloud", "Depth Debug Cloud"),
                 ("viewer", "2D Raw View"),
-                ("slam", "SLAM / Nav"),
+                ("yolo_viewer", "YOLO View"),
+                ("slam", "Localize / Nav"),
                 ("grasp_server", "Grasp Server"),
+                ("cleanup_server", "Road Cleanup Server"),
+                ("step_cleanup_server", "Step Cleanup Server"),
             )
         ):
             ttk.Label(services, text=label, style="State.TLabel", width=16).grid(
@@ -3471,8 +4431,14 @@ class TeachPanelApp:
                 style="Danger.TButton",
             ).grid(row=row, column=3, sticky="ew", padx=4, pady=4)
 
-        joints = ttk.LabelFrame(tab, text="Monitor and Joint")
-        joints.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        monitor = ttk.Frame(details)
+        details.add(monitor, text="Monitor and Log")
+        monitor.columnconfigure(0, weight=1)
+        monitor.columnconfigure(1, weight=1)
+        monitor.rowconfigure(0, weight=1)
+
+        joints = ttk.LabelFrame(monitor, text="Monitor and Joint")
+        joints.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         joints.rowconfigure(0, weight=1)
         joints.columnconfigure(0, weight=1)
         self.joint_tree = ttk.Treeview(joints, columns=("rad", "deg"), show="headings", height=8)
@@ -3482,8 +4448,8 @@ class TeachPanelApp:
         self.joint_tree.column("deg", width=120, anchor="e")
         self.joint_tree.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
-        live_log = ttk.LabelFrame(tab, text="Variables and Log")
-        live_log.grid(row=1, column=1, sticky="nsew")
+        live_log = ttk.LabelFrame(monitor, text="Variables and Log")
+        live_log.grid(row=0, column=1, sticky="nsew")
         live_log.rowconfigure(0, weight=1)
         live_log.columnconfigure(0, weight=1)
         text = tk.Text(live_log, height=10, width=60, state="disabled", wrap="word")
@@ -3493,13 +4459,13 @@ class TeachPanelApp:
     def _build_move_tab(self) -> None:
         tab = self._add_scrollable_tab("Move")
         tab.columnconfigure(0, weight=1)
-        tab.columnconfigure(1, weight=1)
         tab.rowconfigure(1, weight=1)
         self._build_move_monitor(tab)
         left = ttk.Frame(tab)
-        left.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        left.grid(row=1, column=0, sticky="ew")
+        left.columnconfigure(0, weight=1)
         right = ttk.Frame(tab)
-        right.grid(row=1, column=1, sticky="nsew")
+        right.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         right.columnconfigure(0, weight=1)
         self._build_arm_controls(left)
         self._build_joint_target_controls(left)
@@ -3514,10 +4480,18 @@ class TeachPanelApp:
     def _build_move_monitor(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Realtime")
         frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        for column in range(4):
+        for column in range(5):
             frame.columnconfigure(column, weight=1)
-        for column, key in enumerate(("base", "tool", "arm", "gripper")):
-            ttk.Label(frame, text=key, style="State.TLabel").grid(
+        for column, (key, label) in enumerate(
+            (
+                ("base", "base(odom)"),
+                ("tool_aubo", "tool(aubo)"),
+                ("tool_base", "tool(base)"),
+                ("arm", "arm"),
+                ("gripper", "gripper"),
+            )
+        ):
+            ttk.Label(frame, text=label, style="State.TLabel").grid(
                 row=0, column=column, sticky="w", padx=6, pady=(4, 0)
             )
             var = tk.StringVar(value="waiting")
@@ -3544,12 +4518,34 @@ class TeachPanelApp:
         ttk.Label(editor, text="Wait s").grid(row=0, column=3, padx=5, pady=5)
         ttk.Entry(editor, textvariable=self.wait_var, width=8).grid(row=0, column=4, padx=5, pady=5)
         ttk.Button(editor, text="Wait", command=self._add_wait).grid(row=0, column=5, padx=5, pady=5)
+        ttk.Button(editor, text="Visual Grasp", command=self._add_visual_grasp).grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(0, 5)
+        )
+        ttk.Combobox(
+            editor,
+            textvariable=self.visual_grasp_release_var,
+            values=("basket_a", "basket_b"),
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=2, sticky="ew", padx=5, pady=(0, 5))
+        ttk.Checkbutton(editor, text="Base-only Run", variable=self.base_only_run_var).grid(
+            row=1, column=3, columnspan=3, sticky="w", padx=5, pady=(0, 5)
+        )
+        ttk.Checkbutton(
+            editor,
+            text="Hide Program Tree",
+            variable=self.hide_program_tree_var,
+            command=self._toggle_program_tree,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
 
         toolbar = ttk.Frame(tab)
         toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        for column in range(5):
+            toolbar.columnconfigure(column, weight=1)
         for index, (text, command) in enumerate(
             (
                 ("Update", self._update_selected),
+                ("Arm/Grip Update", self._update_arm_grip_selected),
                 ("Duplicate", self._duplicate_selected),
                 ("Delete", self._delete_selected),
                 ("Clear", self._clear),
@@ -3560,18 +4556,60 @@ class TeachPanelApp:
                 ("Stop", self.node.stop_all),
             )
         ):
-            ttk.Button(toolbar, text=text, command=command).grid(row=0, column=index, padx=3)
+            ttk.Button(toolbar, text=text, command=command).grid(
+                row=index // 5,
+                column=index % 5,
+                sticky="ew",
+                padx=3,
+                pady=3,
+            )
 
         program = ttk.LabelFrame(tab, text="Program Tree")
+        self.program_tree_frame = program
         program.grid(row=2, column=0, sticky="nsew")
-        program.rowconfigure(0, weight=1)
+        program.rowconfigure(1, weight=1)
         program.columnconfigure(0, weight=1)
+        ttk.Label(program, textvariable=self.replay_current_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0)
+        )
         self.listbox = tk.Listbox(program, height=18, selectmode=tk.EXTENDED)
-        self.listbox.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.listbox.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         scroll = ttk.Scrollbar(program, command=self.listbox.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
+        scroll.grid(row=1, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=scroll.set)
         ttk.Label(tab, textvariable=self.file_var).grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+    def _toggle_program_tree(self) -> None:
+        if self.program_tree_frame is None:
+            return
+        if self.hide_program_tree_var.get():
+            self.program_tree_frame.grid_remove()
+        else:
+            self.program_tree_frame.grid()
+
+    def _build_demo_tab(self) -> None:
+        tab = self._add_scrollable_tab("Demo")
+        tab.columnconfigure(0, weight=1)
+
+        demo = ttk.LabelFrame(tab, text="Teach Recording Demo")
+        demo.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        demo.columnconfigure(1, weight=1)
+        ttk.Label(demo, text="Recording").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(demo, textvariable=self.demo_file_var).grid(
+            row=0, column=1, columnspan=3, sticky="w", padx=5, pady=5
+        )
+        ttk.Label(demo, textvariable=self.demo_stats_var).grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=5
+        )
+        ttk.Button(demo, text="Load Demo", command=self._load_demo).grid(
+            row=2, column=0, sticky="ew", padx=5, pady=5
+        )
+        ttk.Button(demo, text="Run Demo", command=self._run_demo, style="Primary.TButton").grid(
+            row=2, column=1, sticky="ew", padx=5, pady=5
+        )
+        ttk.Button(demo, text="Stop", command=self.node.stop_all, style="Danger.TButton").grid(
+            row=2, column=2, sticky="ew", padx=5, pady=5
+        )
 
     def _build_config_tab(self) -> None:
         tab = self._add_scrollable_tab("Configure")
@@ -3586,6 +4624,8 @@ class TeachPanelApp:
             ("Joint step deg", self.arm_joint_step_var),
             ("Hold period s", self.arm_hold_period_var),
             ("Waypoint duration s", self.waypoint_duration_var),
+            ("Arm speed rad/s", self.arm_speed_var),
+            ("Arm accel rad/s2", self.arm_accel_var),
             ("Gripper settle s", self.gripper_settle_var),
         )
         for row, (label, var) in enumerate(fields):
@@ -3626,7 +4666,6 @@ class TeachPanelApp:
         ttk.Button(
             presets, text="Set Install From Current", command=self._set_install_from_current
         ).grid(row=0, column=3, sticky="ew", padx=6, pady=5)
-
         config = ttk.LabelFrame(tab, text="Local Config")
         config.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         config.columnconfigure(1, weight=1)
@@ -3651,7 +4690,7 @@ class TeachPanelApp:
 
         payload = ttk.LabelFrame(tab, text="Aubo Payload")
         payload.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(payload, text="Startup payload is configured by scripts/hardware/real_full_teach.sh.").grid(
+        ttk.Label(payload, text="Startup payload is configured by launch parameters.").grid(
             row=0, column=0, sticky="w", padx=6, pady=4
         )
         payload_mass = float(self.node.get_parameter("aubo_payload_mass_kg").value)
@@ -3689,11 +4728,15 @@ class TeachPanelApp:
         for column in range(3):
             frame.columnconfigure(column, weight=1)
         buttons = {
+            "Fwd Left": ("forward_left", 0, 0),
             "Forward": ("forward", 0, 1),
-            "Back": ("back", 2, 1),
+            "Fwd Right": ("forward_right", 0, 2),
             "Left": ("left", 1, 0),
-            "Right": ("right", 1, 2),
             "Stop": ("stop", 1, 1),
+            "Right": ("right", 1, 2),
+            "Back Left": ("back_left", 2, 0),
+            "Back": ("back", 2, 1),
+            "Back Right": ("back_right", 2, 2),
         }
         for text, (direction, row, column) in buttons.items():
             button = ttk.Button(frame, text=text)
@@ -3706,7 +4749,35 @@ class TeachPanelApp:
         base_rec_button = ttk.Button(
             frame, text="Program Rec Off", command=self._toggle_program_recording
         )
-        base_rec_button.grid(row=3, column=0, columnspan=3, padx=4, pady=(8, 4), sticky="ew")
+        ttk.Label(frame, text="Distance m").grid(row=3, column=0, padx=4, pady=(8, 4))
+        ttk.Entry(frame, textvariable=self.base_distance_var, width=8).grid(
+            row=3, column=1, padx=4, pady=(8, 4), sticky="ew"
+        )
+        ttk.Button(frame, text="Go Fwd", command=lambda: self._move_base_distance(1.0)).grid(
+            row=3, column=2, padx=4, pady=(8, 4), sticky="ew"
+        )
+        ttk.Button(frame, text="Go Back", command=lambda: self._move_base_distance(-1.0)).grid(
+            row=4, column=2, padx=4, pady=4, sticky="ew"
+        )
+        ttk.Label(frame, text="Speed m/s").grid(row=4, column=0, padx=4, pady=4)
+        ttk.Entry(frame, textvariable=self.base_target_linear_speed_var, width=8).grid(
+            row=4, column=1, padx=4, pady=4, sticky="ew"
+        )
+        ttk.Label(frame, text="Angle deg").grid(row=5, column=0, padx=4, pady=(8, 4))
+        ttk.Entry(frame, textvariable=self.base_angle_var, width=8).grid(
+            row=5, column=1, padx=4, pady=(8, 4), sticky="ew"
+        )
+        ttk.Button(frame, text="Turn Left", command=lambda: self._turn_base_relative(1.0)).grid(
+            row=5, column=2, padx=4, pady=(8, 4), sticky="ew"
+        )
+        ttk.Button(frame, text="Turn Right", command=lambda: self._turn_base_relative(-1.0)).grid(
+            row=6, column=2, padx=4, pady=4, sticky="ew"
+        )
+        ttk.Label(frame, text="Turn speed rad/s").grid(row=6, column=0, padx=4, pady=4)
+        ttk.Entry(frame, textvariable=self.base_target_angular_speed_var, width=8).grid(
+            row=6, column=1, padx=4, pady=4, sticky="ew"
+        )
+        base_rec_button.grid(row=7, column=0, columnspan=3, padx=4, pady=(8, 4), sticky="ew")
         self.program_record_buttons.append(base_rec_button)
 
     def _build_arm_controls(self, parent: ttk.Frame) -> None:
@@ -3787,7 +4858,7 @@ class TeachPanelApp:
         )
 
     def _build_tool_target_controls(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="TCP Target")
+        frame = ttk.LabelFrame(parent, text="TCP Target (AUBO base)")
         frame.grid(row=0, column=0, sticky="ew")
         for column in range(3):
             frame.columnconfigure(column, weight=1)
@@ -3816,6 +4887,18 @@ class TeachPanelApp:
         button.bind("<Leave>", lambda _event: self._preset_hold_release())
         return button
 
+    def _publish_custom_gripper(self) -> None:
+        text = self.gripper_custom_var.get().strip()
+        command = _normalize_gripper_command(text)
+        if command is None or not command.isdigit():
+            messagebox.showerror(
+                "Gripper",
+                f"Enter an integer from {GRIPPER_CUSTOM_MIN} to {GRIPPER_CUSTOM_MAX}.",
+            )
+            return
+        self.gripper_custom_var.set(command)
+        self.node.publish_gripper(command)
+
     def _build_gripper_controls(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Gripper")
         frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -3825,8 +4908,20 @@ class TeachPanelApp:
         ttk.Button(frame, text="Close", command=lambda: self.node.publish_gripper("close")).grid(
             row=0, column=1, padx=4, pady=4
         )
+        for index, command in enumerate(GRIPPER_PRESET_COMMANDS, start=2):
+            ttk.Button(
+                frame,
+                text=command,
+                command=lambda value=command: self.node.publish_gripper(value),
+            ).grid(row=index // 2, column=index % 2, padx=4, pady=4, sticky="ew")
+        ttk.Entry(frame, textvariable=self.gripper_custom_var, width=8).grid(
+            row=3, column=0, padx=4, pady=4, sticky="ew"
+        )
+        ttk.Button(frame, text="Set", command=self._publish_custom_gripper).grid(
+            row=3, column=1, padx=4, pady=4, sticky="ew"
+        )
         ttk.Button(frame, text="Stop All", command=self.node.stop_all).grid(
-            row=1, column=0, columnspan=2, padx=4, pady=4, sticky="ew"
+            row=4, column=0, columnspan=2, padx=4, pady=4, sticky="ew"
         )
 
     def _refresh(self) -> None:
@@ -3896,6 +4991,8 @@ class TeachPanelApp:
                 arm_joint_step_deg=float(self.arm_joint_step_var.get()),
                 arm_hold_period_sec=float(self.arm_hold_period_var.get()),
                 waypoint_duration_sec=float(self.waypoint_duration_var.get()),
+                arm_speed_rad_sec=float(self.arm_speed_var.get()),
+                arm_accel_rad_sec2=float(self.arm_accel_var.get()),
                 gripper_settle_sec=float(self.gripper_settle_var.get()),
                 arm_home_joints_deg=self.home_joints_var.get(),
                 arm_install_joints_deg=self.install_joints_var.get(),
@@ -4013,6 +5110,12 @@ class TeachPanelApp:
         self.waypoint_duration_var.set(
             f"{float(self.node.get_parameter('arm_waypoint_duration_sec').value):.2f}"
         )
+        self.arm_speed_var.set(
+            f"{float(self.node.get_parameter('aubo_sdk_move_speed_rad_sec').value):.2f}"
+        )
+        self.arm_accel_var.set(
+            f"{float(self.node.get_parameter('aubo_sdk_move_accel_rad_sec2').value):.2f}"
+        )
         self.gripper_settle_var.set(
             f"{float(self.node.get_parameter('gripper_settle_sec').value):.1f}"
         )
@@ -4077,6 +5180,62 @@ class TeachPanelApp:
             return
         self.node.move_tool_to_position(target)
 
+    def _move_base_distance(self, sign: float) -> None:
+        try:
+            distance = float(self.base_distance_var.get())
+        except ValueError:
+            messagebox.showerror("Base Move", "Distance must be a numeric meter value.")
+            return
+        max_distance = abs(
+            float(self.node.get_parameter("base_motion_max_segment_sec").value)
+            * float(self.node.get_parameter("base_linear_speed").value)
+        )
+        if not math.isfinite(distance) or distance <= 0.0 or distance > max_distance:
+            messagebox.showerror(
+                "Base Move",
+                f"Distance must be > 0 and <= {max_distance:.2f} m.",
+            )
+            return
+        speed = self._positive_base_input(
+            self.base_target_linear_speed_var.get(), "Base Move", "Speed m/s"
+        )
+        if speed is None:
+            return
+        self.node.set_parameters(
+            [Parameter("base_replay_linear_speed", Parameter.Type.DOUBLE, speed)]
+        )
+        self.node.move_base_distance(float(sign) * distance)
+
+    def _turn_base_relative(self, sign: float) -> None:
+        try:
+            angle_deg = float(self.base_angle_var.get())
+        except ValueError:
+            messagebox.showerror("Base Turn", "Angle must be a numeric degree value.")
+            return
+        if not math.isfinite(angle_deg) or angle_deg <= 0.0 or angle_deg > 360.0:
+            messagebox.showerror("Base Turn", "Angle must be > 0 and <= 360 deg.")
+            return
+        speed = self._positive_base_input(
+            self.base_target_angular_speed_var.get(), "Base Turn", "Turn speed rad/s"
+        )
+        if speed is None:
+            return
+        self.node.set_parameters(
+            [Parameter("base_replay_angular_speed", Parameter.Type.DOUBLE, speed)]
+        )
+        self.node.turn_base_relative(float(sign) * math.radians(angle_deg))
+
+    def _positive_base_input(self, text: str, title: str, label: str) -> float | None:
+        try:
+            value = float(text)
+        except ValueError:
+            messagebox.showerror(title, f"{label} must be numeric.")
+            return None
+        if not math.isfinite(value) or value <= 0.0:
+            messagebox.showerror(title, f"{label} must be > 0.")
+            return None
+        return value
+
     def _base_press(self, direction: str) -> None:
         self.node.drive_base_manual(direction)
 
@@ -4122,6 +5281,14 @@ class TeachPanelApp:
         self.label_var.set(f"wp_{len(self.waypoints) + 1}")
         self._refresh_waypoints()
 
+    def _add_visual_grasp(self) -> None:
+        waypoint = self.node.record_visual_grasp(
+            self.label_var.get(), self.visual_grasp_release_var.get()
+        )
+        self.waypoints.append(waypoint)
+        self.label_var.set(f"wp_{len(self.waypoints) + 1}")
+        self._refresh_waypoints()
+
     def _delete_selected(self) -> None:
         selected = list(self.listbox.curselection())
         for index in reversed(selected):
@@ -4151,6 +5318,31 @@ class TeachPanelApp:
         self.listbox.selection_set(index)
         self.listbox.see(index)
 
+    def _update_arm_grip_selected(self) -> None:
+        selected = list(self.listbox.curselection())
+        if len(selected) != 1:
+            messagebox.showinfo("Arm/Grip Update", "Select exactly one pose waypoint first.")
+            return
+        index = selected[0]
+        source = self.waypoints[index]
+        if source.kind == "wait":
+            messagebox.showinfo("Arm/Grip Update", "Wait nodes do not have arm/gripper targets.")
+            return
+        try:
+            arm, tool, gripper = self.node.arm_gripper_snapshot()
+        except Exception as exc:
+            messagebox.showerror("Arm/Grip Update", str(exc))
+            return
+        waypoint = _waypoint_from_dict(asdict(source))
+        waypoint.arm_joints = arm
+        waypoint.tool_position = tool
+        waypoint.gripper = gripper
+        waypoint.stamp = datetime.now().isoformat(timespec="seconds")
+        self.waypoints[index] = waypoint
+        self._refresh_waypoints()
+        self.listbox.selection_set(index)
+        self.listbox.see(index)
+
     def _duplicate_selected(self) -> None:
         selected = list(self.listbox.curselection())
         if not selected:
@@ -4174,6 +5366,7 @@ class TeachPanelApp:
         self.node.clear_base_motion_history()
         self.label_var.set("wp_1")
         self._refresh_waypoints()
+        self._reset_replay_current()
 
     def _reset(self) -> None:
         self.node.stop_all()
@@ -4183,6 +5376,7 @@ class TeachPanelApp:
         self.wait_var.set("2.0")
         self.file_var.set("unsaved")
         self._refresh_waypoints()
+        self._reset_replay_current()
 
     def _save(self) -> None:
         default = self.node.recording_dir() / f"arachne_teach_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -4210,20 +5404,124 @@ class TeachPanelApp:
         )
         if not path:
             return
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        self._load_recording_path(Path(path))
+
+    def _demo_recording_path(self) -> Path:
+        path = Path(DEFAULT_DEMO_RECORDING_PATH)
+        return path if path.is_absolute() else root_dir() / path
+
+    def _demo_stats_text(self) -> str:
+        try:
+            payload = json.loads(self._demo_recording_path().read_text(encoding="utf-8"))
+            waypoints = payload.get("waypoints", [])
+            base_segments = sum(len(item.get("base_motion") or []) for item in waypoints)
+            return f"Demo: {len(waypoints)} waypoints, {base_segments} base segments"
+        except Exception as exc:
+            return f"Demo: unavailable ({exc})"
+
+    def _load_demo(self) -> None:
+        try:
+            self._load_recording_path(self._demo_recording_path())
+        except Exception as exc:
+            messagebox.showerror("Load Demo", str(exc))
+
+    def _run_demo(self) -> None:
+        try:
+            if Path(self.file_var.get()) != self._demo_recording_path():
+                self._load_recording_path(self._demo_recording_path())
+            self._play()
+        except Exception as exc:
+            messagebox.showerror("Run Demo", str(exc))
+
+    def _load_recording_path(self, path: Path) -> None:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        replay_args = payload.get("recommended_replay_args", {})
+        replay_params = []
+        if isinstance(replay_args, dict):
+            for name in (
+                "aubo_sdk_move_speed_rad_sec",
+                "arm_waypoint_duration_sec",
+                "replay_settle_sec",
+            ):
+                if name in replay_args:
+                    replay_params.append(
+                        Parameter(name, Parameter.Type.DOUBLE, float(replay_args[name]))
+                    )
+        if replay_params:
+            self.node.set_parameters(replay_params)
+            self._sync_config_vars_from_node()
+            self.node._status(
+                "applied replay args: "
+                + ", ".join(f"{item.name}={item.value}" for item in replay_params)
+            )
         self.waypoints = [_waypoint_from_dict(item) for item in payload.get("waypoints", [])]
-        self.file_var.set(path)
+        base_segments = sum(len(waypoint.base_motion) for waypoint in self.waypoints)
+        self.file_var.set(str(path))
+        if path == self._demo_recording_path():
+            self.demo_stats_var.set(
+                f"Demo: {len(self.waypoints)} waypoints, {base_segments} base segments"
+            )
         self.label_var.set(f"wp_{len(self.waypoints) + 1}")
         self._refresh_waypoints()
+        self._reset_replay_current()
 
     def _play(self) -> None:
-        self.node.replay(self.waypoints)
+        base_only = bool(self.base_only_run_var.get())
+        self.node.replay(
+            self.waypoints,
+            replay_arm=not base_only,
+            replay_gripper=not base_only,
+            progress_callback=self._on_replay_progress,
+        )
+
+    def _reset_replay_current(self) -> None:
+        self.replay_current_var.set("Current: -")
+        if self.listbox is not None:
+            self.listbox.selection_clear(0, tk.END)
+
+    def _on_replay_progress(
+        self,
+        index: int | None,
+        total: int,
+        label: str,
+        state: str,
+    ) -> None:
+        self.root.after(0, lambda: self._apply_replay_progress(index, total, label, state))
+
+    def _apply_replay_progress(
+        self,
+        index: int | None,
+        total: int,
+        label: str,
+        state: str,
+    ) -> None:
+        if state == "running" and index is not None:
+            self.replay_current_var.set(f"Current: {index:02d}/{total} {label}")
+            if self.listbox is not None:
+                row = max(0, index - 1)
+                self.listbox.selection_clear(0, tk.END)
+                self.listbox.selection_set(row)
+                self.listbox.activate(row)
+                self.listbox.see(row)
+            return
+        if state == "failed":
+            self.replay_current_var.set(f"Current: failed: {label}")
+        else:
+            self.replay_current_var.set(f"Current: {state}")
 
     def _refresh_waypoints(self) -> None:
         self.listbox.delete(0, tk.END)
         for index, waypoint in enumerate(self.waypoints, start=1):
             if waypoint.kind == "wait":
                 self.listbox.insert(tk.END, f"{index:02d} {waypoint.label} | wait={waypoint.wait_sec:.1f}s")
+                continue
+            if waypoint.kind == "visual_grasp":
+                command = waypoint.task_command or "start"
+                release_point = command.split(":", 1)[1] if ":" in command else "basket_a"
+                self.listbox.insert(
+                    tk.END,
+                    f"{index:02d} {waypoint.label} | visual_grasp={command} release={release_point}",
+                )
                 continue
             tool = waypoint.tool_position
             moves = self._base_motion_summary(waypoint.base_motion)
@@ -4253,7 +5551,11 @@ class TeachPanelApp:
                 angle = math.degrees(float(normalized.get("angle_rad", 0.0)))
                 parts.append(f"{action} {angle:.0f}deg")
             else:
-                parts.append(f"{action} {float(normalized.get('duration_sec', 0.0)):.1f}s")
+                parts.append(
+                    f"{action} vx={float(normalized.get('linear_x', 0.0)):.2f} "
+                    f"wz={float(normalized.get('angular_z', 0.0)):.2f} "
+                    f"t={float(normalized.get('duration_sec', 0.0)):.1f}s"
+                )
         if len(segments) > 3:
             parts.append(f"+{len(segments) - 3}")
         return ", ".join(parts)
@@ -4262,16 +5564,30 @@ class TeachPanelApp:
         self.root.mainloop()
 
 
-def main() -> None:
-    rclpy.init()
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Arachne teach panel")
+    parser.add_argument(
+        "--headless-check",
+        action="store_true",
+        help="validate imports and entrypoint wiring without starting Tk or hardware I/O",
+    )
+    args, ros_args = parser.parse_known_args(argv)
+    if args.headless_check:
+        print("teach_panel headless check ok")
+        return
+
+    rclpy.init(args=ros_args)
     node = TeachPanelNode()
-    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    executor = MultiThreadedExecutor(num_threads=6)
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     try:
         TeachPanelApp(node).run()
     finally:
         node.stop_all()
         node.stop_all_managed_processes()
+        executor.remove_node(node)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

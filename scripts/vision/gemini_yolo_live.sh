@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Arachne helper only; not a stable runtime entrypoint. Prefer ROS2 package entrypoints in README.md.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -29,8 +30,6 @@ if [[ -v ARACHNE_YOLO_CLASSES ]]; then
   if [[ -n "${ARACHNE_YOLO_CLASSES}" ]]; then
     CLASS_ARGS+=(--classes "${ARACHNE_YOLO_CLASSES}")
   fi
-else
-  CLASS_ARGS+=(--classes "trash")
 fi
 
 nohup setsid ./scripts/vision/gemini_yolo_test.sh \

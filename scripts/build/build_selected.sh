@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Arachne helper only; not a stable runtime entrypoint. Prefer ROS2 package entrypoints in README.md.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -16,6 +17,8 @@ unset ARACHNE_ENV_NO_WORKSPACE
 set -u
 
 cd "${ROOT_DIR}"
+BUILD_LOG_DIR="${ROOT_DIR}/log/build"
+mkdir -p "${BUILD_LOG_DIR}"
 arachne_remove_workspace_underlay "${ROOT_DIR}"
 
 if [[ -z "${MAKEFLAGS:-}" && "$(uname -m)" == "aarch64" ]]; then
@@ -29,6 +32,6 @@ elif [[ "$(uname -m)" == "aarch64" ]]; then
   COLCON_ARGS+=(--parallel-workers 2)
 fi
 
-colcon build "${COLCON_ARGS[@]}" --base-paths src --packages-select "$@" \
+colcon --log-base "${BUILD_LOG_DIR}" build "${COLCON_ARGS[@]}" --base-paths src --packages-select "$@" \
   --symlink-install \
   --cmake-args -DPython3_EXECUTABLE="${ARACHNE_SYSTEM_PYTHON}"

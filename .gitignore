@@ -5,9 +5,11 @@ build/
 install/
 log/
 logs/
+runtime_logs/
 .colcon/
 .ros/
-.vscode
+.vscode/
+.DS_Store
 
 # Godot editor/import cache and generated asset links.
 godot/**/.godot/
@@ -15,12 +17,16 @@ godot/**/.import/
 godot/**/assets/generated/
 godot/**/assets/vendor/*
 !godot/**/assets/vendor/README.md
-!godot/**/assets/vendor/README.zh-CN.md
 !godot/**/assets/vendor/.gdignore
 # Python generated files
-*.pyc
-__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.log
+*.tmp
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Local secrets and agent provider credentials.
 .env
@@ -40,9 +46,6 @@ credentials/
 recordings/*
 !recordings/teach/
 !recordings/teach/*.json
-
-# Internal stage reports are local working notes, not public docs.
-docs/reports/
 
 # Local planning notes are not part of the public repository.
 plan.md
@@ -105,7 +108,6 @@ third_party/scout_ros2/.git/
 !third_party/ugv_sdk/
 !third_party/ugv_sdk/**
 third_party/ugv_sdk/.git/
-third_party/ugv_sdk/docs/**
 
 !third_party/aubo_ros2_driver/
 !third_party/aubo_ros2_driver/**
@@ -133,9 +135,18 @@ third_party/scout_ros/**
 
 # Keep the small source assets needed to reproduce the active MS42DC model.
 !third_party/README.md
-!third_party/README.zh-CN.md
 !third_party/MS42DC.step
 !third_party/MS42DC_SPLIT/
 !third_party/MS42DC_SPLIT/*.stl
 
 tmp/
+temp/
+cache/
+
+# Local YOLO/TensorRT artifacts can be large and machine-specific.
+yolo_workspace/runs/
+yolo_workspace/cache/
+yolo_workspace/temp/
+yolo_workspace/tmp/
+yolo_workspace/**/*.cache
+yolo_workspace/**/*.engine

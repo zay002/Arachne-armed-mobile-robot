@@ -38,8 +38,8 @@ class MS42DCDirectSerialDriver(Node):
         self.declare_parameter("device_id", 1)
         self.declare_parameter("sub_divide", 32)
         self.declare_parameter("mode", 2)
-        self.declare_parameter("open_angle_tenths", 18720)
-        self.declare_parameter("close_angle_tenths", 18720)
+        self.declare_parameter("open_angle_tenths", 19656)
+        self.declare_parameter("close_angle_tenths", 19656)
         self.declare_parameter("speed_tenths", 150)
         self.declare_parameter("retry_on_error", True)
         self.declare_parameter("query_after_command", True)
@@ -56,7 +56,12 @@ class MS42DCDirectSerialDriver(Node):
             Float64, str(self.get_parameter("angle_topic").value), self._on_angle, 10
         )
         self.create_timer(1.0, self._publish_status)
-        self._open_serial()
+        self.target_opening_tenths = int(self.get_parameter("open_angle_tenths").value)
+        try:
+            self._open_serial()
+        except (OSError, serial.SerialException) as exc:
+            self.last_status = f"serial unavailable: {self.get_parameter('port').value}: {exc}"
+            self.get_logger().warning(self.last_status)
 
     def _on_command(self, msg: String) -> None:
         command = msg.data.strip().lower()
@@ -66,16 +71,21 @@ class MS42DCDirectSerialDriver(Node):
                 angle_tenths=int(self.get_parameter("close_angle_tenths").value),
                 label="close",
             )
+            self.target_opening_tenths = 0
         elif command in ("open", "home"):
+            angle = int(self.get_parameter("open_angle_tenths").value)
             self._send_motion(
                 direction=0,
-                angle_tenths=int(self.get_parameter("open_angle_tenths").value),
+                angle_tenths=angle,
                 label="open",
             )
+            self.target_opening_tenths = angle
         elif command == "stop":
             self._send_motion(direction=0, angle_tenths=0, speed_tenths=0, label="stop")
         elif command in ("status", "query"):
             self._query_and_publish_status("status")
+        elif command.isdigit():
+            self._send_opening_target(int(command))
         else:
             self.get_logger().warning(f"Ignoring unknown gripper command: {msg.data!r}")
 
@@ -83,6 +93,30 @@ class MS42DCDirectSerialDriver(Node):
         direction = 1 if msg.data >= 0.0 else 0
         angle = int(round(abs(float(msg.data)) * 10.0))
         self._send_motion(direction=direction, angle_tenths=angle, label="angle")
+        self._update_target_opening(direction=direction, angle_tenths=angle)
+
+    def _send_opening_target(self, target_tenths: int) -> None:
+        max_open = max(int(self.get_parameter("open_angle_tenths").value), 1)
+        target = max(0, min(int(target_tenths), max_open))
+        current = max(0, min(int(self.target_opening_tenths), max_open))
+        delta = target - current
+        if delta == 0:
+            self.last_status = f"opening target unchanged: {target}/{max_open}"
+            self.get_logger().info(self.last_status)
+            return
+        self._send_motion(
+            direction=0 if delta > 0 else 1,
+            angle_tenths=abs(delta),
+            label=f"opening {target}/{max_open}",
+        )
+        self.target_opening_tenths = target
+
+    def _update_target_opening(self, *, direction: int, angle_tenths: int) -> None:
+        max_open = max(int(self.get_parameter("open_angle_tenths").value), 1)
+        delta = -int(angle_tenths) if int(direction) == 1 else int(angle_tenths)
+        self.target_opening_tenths = max(
+            0, min(int(self.target_opening_tenths) + delta, max_open)
+        )
 
     def _send_motion(
         self,

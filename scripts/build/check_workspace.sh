@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Arachne helper only; not a stable runtime entrypoint. Prefer ROS2 package entrypoints in README.md.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -8,6 +9,8 @@ source "${ROOT_DIR}/scripts/env/arachne_env.sh"
 set -u
 
 cd "${ROOT_DIR}"
+BUILD_LOG_DIR="${ROOT_DIR}/log/build"
+mkdir -p "${BUILD_LOG_DIR}"
 
 if [[ -z "${MAKEFLAGS:-}" && "$(uname -m)" == "aarch64" ]]; then
   export MAKEFLAGS="-j2"
@@ -31,7 +34,7 @@ echo "== Python syntax =="
   src/arachne_sim/arachne_sim/*.py
 
 echo "== Build local packages =="
-colcon build "${COLCON_ARGS[@]}" --base-paths src --packages-select \
+colcon --log-base "${BUILD_LOG_DIR}" build "${COLCON_ARGS[@]}" --base-paths src --packages-select \
   aubo_description scout_description dh_ag95_description \
   arachne_description arachne_sim arachne_gripper arachne_hardware \
   arachne_control arachne_moveit_config arachne_nav arachne_operator arachne_sensors \

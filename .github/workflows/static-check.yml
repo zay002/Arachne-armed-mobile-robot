@@ -1,0 +1,33 @@
+name: static-check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - jetson
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check key files
+        run: |
+          test -f src/arachne_hardware/action/AuboMoveJoint.action
+          test -f src/arachne_hardware/arachne_hardware/aubo_move_joint_action_server.py
+          test -f src/arachne_operator/arachne_operator/demo_orchestrator.py
+          test -f src/arachne_operator/arachne_operator/teach_panel.py
+          test -f src/arachne_operator/arachne_operator/grasp_task_server.py
+          test -f src/arachne_operator/arachne_operator/road_cleanup_task_server.py
+
+      - name: Bash syntax
+        run: |
+          find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+      - name: Python compile
+        run: |
+          python3 -m compileall \
+            src/arachne_hardware/arachne_hardware \
+            src/arachne_operator/arachne_operator

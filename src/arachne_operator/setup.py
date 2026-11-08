@@ -22,11 +22,19 @@ setup(
     entry_points={
         "console_scripts": [
             "action_chunk_translator = arachne_operator.action_chunk_translator:main",
+            "arachne = arachne_operator.cli:main",
             "apriltag_hand_eye_calibrator = arachne_operator.apriltag_hand_eye_calibrator:main",
+            "apriltag_nav_initializer = arachne_operator.apriltag_nav_initializer:main",
+            "aubo_readonly_probe = arachne_operator.aubo_readonly_probe:main",
+            "demo_orchestrator = arachne_operator.demo_orchestrator:main",
             "grasp_task_server = arachne_operator.grasp_task_server:main",
+            "grasp_preview_pipeline = arachne_operator.grasp_preview_pipeline:main",
             "operator_panel = arachne_operator.operator_panel:main",
+            "raw_image_viewer = arachne_operator.raw_image_viewer:main",
             "real_hardware_acceptance_test = arachne_operator.real_hardware_acceptance_test:main",
+            "road_cleanup_task_server = arachne_operator.road_cleanup_task_server:main",
             "sequence_executor = arachne_operator.sequence_executor:main",
+            "step_cleanup_demo = arachne_operator.step_cleanup_demo:main",
             "teach_panel = arachne_operator.teach_panel:main",
             (
                 "teach_visualization_joint_states = "

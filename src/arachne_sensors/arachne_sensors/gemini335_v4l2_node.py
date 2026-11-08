@@ -75,6 +75,8 @@ class Gemini335V4L2Node(Node):
         self.declare_parameter("color_height", 480)
         self.declare_parameter("color_fps", 30.0)
         self.declare_parameter("color_fourcc", "YUYV")
+        self.declare_parameter("color_yuv_layout", "YUYV")
+        self.declare_parameter("color_v4l2_controls", "")
         self.declare_parameter("color_batch_frames", 30)
         self.declare_parameter("color_capture_timeout_sec", 4.0)
         self.declare_parameter("color_frame_id", "camera_color_optical_frame")
@@ -110,6 +112,7 @@ class Gemini335V4L2Node(Node):
         self.color_width = int(self.get_parameter("color_width").value)
         self.color_height = int(self.get_parameter("color_height").value)
         self.color_fps = float(self.get_parameter("color_fps").value)
+        self.color_v4l2_controls = str(self.get_parameter("color_v4l2_controls").value)
         self.color_batch_frames = max(int(self.get_parameter("color_batch_frames").value), 1)
         self.color_capture_timeout_sec = max(
             float(self.get_parameter("color_capture_timeout_sec").value), 0.5
@@ -152,7 +155,11 @@ class Gemini335V4L2Node(Node):
         self.depth_pub = self.create_publisher(Image, "/camera/depth/image_raw", 10)
         self.depth_color_pub = self.create_publisher(Image, "/camera/depth/image_color", 10)
         self.depth_info_pub = self.create_publisher(CameraInfo, "/camera/depth/camera_info", 10)
-        self.points_pub = self.create_publisher(PointCloud2, "/camera/points", 10)
+        self.points_pub = (
+            self.create_publisher(PointCloud2, "/camera/points", 10)
+            if self.publish_pointcloud
+            else None
+        )
 
         self.color_capture: cv2.VideoCapture | None = None
         self.color_process: subprocess.Popen[bytes] | None = None
@@ -243,7 +250,33 @@ class Gemini335V4L2Node(Node):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.color_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.color_height)
         cap.set(cv2.CAP_PROP_FPS, self.color_fps)
+        self._apply_color_v4l2_controls()
         self.color_capture = cap
+
+    def _apply_color_v4l2_controls(self) -> None:
+        controls = [
+            item.strip()
+            for item in self.color_v4l2_controls.replace(";", ",").split(",")
+            if item.strip()
+        ]
+        for control in controls:
+            result = subprocess.run(
+                [
+                    "v4l2-ctl",
+                    "--silent",
+                    "-d",
+                    self.color_device,
+                    f"--set-ctrl={control}",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip()
+                suffix = f": {detail}" if detail else ""
+                self._warn_color(f"Gemini335 color control ignored {control!r}{suffix}")
 
     def _start_depth_stream(self) -> None:
         if not os.path.exists(self.depth_device):
@@ -279,12 +312,19 @@ class Gemini335V4L2Node(Node):
             return
         frame_bytes = self.color_width * self.color_height * bytes_per_pixel
         period = 1.0 / max(self.color_fps, 0.1)
-        command = [
+        configure_command = [
             "v4l2-ctl",
+            "--silent",
             "-d",
             self.color_device,
             f"--set-fmt-video=width={self.color_width},height={self.color_height},pixelformat={pixelformat}",
             f"--set-parm={max(self.color_fps, 1.0):g}",
+        ]
+        command = [
+            "v4l2-ctl",
+            "--silent",
+            "-d",
+            self.color_device,
             "--stream-mmap=4",
             "--stream-count=0",
             "--stream-to=-",
@@ -293,6 +333,13 @@ class Gemini335V4L2Node(Node):
             start = time.monotonic()
             process: subprocess.Popen[bytes] | None = None
             try:
+                subprocess.run(
+                    configure_command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                )
+                self._apply_color_v4l2_controls()
                 process = subprocess.Popen(
                     command,
                     stdout=subprocess.PIPE,
@@ -308,11 +355,16 @@ class Gemini335V4L2Node(Node):
                     process.terminate()
                     self._sleep_color_period(start, period)
                     continue
-                code = (
-                    cv2.COLOR_YUV2BGR_UYVY
-                    if pixelformat == "UYVY"
-                    else cv2.COLOR_YUV2BGR_YUY2
-                )
+                layout = str(self.get_parameter("color_yuv_layout").value).strip().upper()
+                code = {
+                    "UYVY": cv2.COLOR_YUV2BGR_UYVY,
+                    "YUYV": cv2.COLOR_YUV2BGR_YUY2,
+                    "YUY2": cv2.COLOR_YUV2BGR_YUY2,
+                    "YVYU": cv2.COLOR_YUV2BGR_YVYU,
+                }.get(layout)
+                if code is None:
+                    self._warn_color(f"unknown color_yuv_layout={layout}; falling back to YVYU")
+                    code = cv2.COLOR_YUV2BGR_YVYU
                 while not self.stop_event.is_set():
                     chunk = process.stdout.read(frame_bytes)
                     if len(chunk) != frame_bytes:
@@ -536,6 +588,8 @@ class Gemini335V4L2Node(Node):
         self._publish_safe(self.depth_color_pub, _image_from_array(color, header, "bgr8"))
 
     def _publish_pointcloud(self, depth: np.ndarray, stamp: rclpy.time.Time) -> None:
+        if self.points_pub is None:
+            return
         points = self._depth_to_points(depth)
         header = self._header(stamp, self.depth_frame_id)
         cloud = point_cloud2.create_cloud_xyz32(header, points)

@@ -6,7 +6,7 @@ from ament_index_python.packages import get_package_share_directory, PackageNotF
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -17,7 +17,7 @@ def _package_launch(package_name: str, *relative: str) -> PythonLaunchDescriptio
     except PackageNotFoundError as exc:
         raise RuntimeError(
             f"Missing ROS2 package `{package_name}`. Run scripts/hardware/fetch_third_party.sh "
-            "and scripts/hardware/prepare_ms42dc_ros2.sh, then rebuild the workspace."
+            "and scripts/hardware/prepare_real_hardware_ros.sh, then rebuild the workspace."
         ) from exc
     return PythonLaunchDescriptionSource(str(package_share.joinpath(*relative)))
 
@@ -179,24 +179,25 @@ def _launch_setup(context, *args, **kwargs):
             )
 
     if enabled("use_aubo"):
-        actions.append(
-            IncludeLaunchDescription(
-                _package_launch("aubo_ros2_driver", "launch", "aubo_control.launch.py"),
-                launch_arguments={
-                    "aubo_type": LaunchConfiguration("aubo_type"),
-                    "robot_ip": LaunchConfiguration("aubo_robot_ip"),
-                    "use_fake_hardware": "false",
-                    "runtime_config_package": LaunchConfiguration(
-                        "aubo_runtime_config_package"
-                    ),
-                    "controllers_file": LaunchConfiguration("aubo_controllers_file"),
-                    "initial_joint_controller": LaunchConfiguration(
-                        "aubo_initial_joint_controller"
-                    ),
-                    "aubo_control_prefix": LaunchConfiguration("aubo_control_prefix"),
-                }.items(),
+        if enabled("use_aubo_ros2_driver"):
+            actions.append(
+                IncludeLaunchDescription(
+                    _package_launch("aubo_ros2_driver", "launch", "aubo_control.launch.py"),
+                    launch_arguments={
+                        "aubo_type": LaunchConfiguration("aubo_type"),
+                        "robot_ip": LaunchConfiguration("aubo_robot_ip"),
+                        "use_fake_hardware": "false",
+                        "runtime_config_package": LaunchConfiguration(
+                            "aubo_runtime_config_package"
+                        ),
+                        "controllers_file": LaunchConfiguration("aubo_controllers_file"),
+                        "initial_joint_controller": LaunchConfiguration(
+                            "aubo_initial_joint_controller"
+                        ),
+                        "aubo_control_prefix": LaunchConfiguration("aubo_control_prefix"),
+                    }.items(),
+                )
             )
-        )
 
         actions.append(
             Node(
@@ -298,6 +299,56 @@ def _launch_setup(context, *args, **kwargs):
             )
         )
 
+        actions.append(
+            Node(
+                package="arachne_hardware",
+                executable="aubo_move_joint_action_server",
+                name="aubo_move_joint_action_server",
+                parameters=[
+                    {
+                        "action_name": LaunchConfiguration("aubo_move_joint_action_name"),
+                        "robot_ip": LaunchConfiguration("aubo_robot_ip"),
+                        "rpc_port": ParameterValue(
+                            LaunchConfiguration("aubo_rpc_port"), value_type=int
+                        ),
+                        "rpc_timeout_sec": ParameterValue(
+                            LaunchConfiguration("aubo_rpc_timeout_sec"), value_type=float
+                        ),
+                        "teach_flag_path": LaunchConfiguration("aubo_teach_flag_path"),
+                        "control_owner_path": LaunchConfiguration("aubo_control_owner_path"),
+                        "control_owner_name": LaunchConfiguration(
+                            "aubo_move_joint_control_owner_name"
+                        ),
+                        "default_speed_rad_sec": ParameterValue(
+                            LaunchConfiguration("aubo_sdk_move_joint_speed_rad_sec"),
+                            value_type=float,
+                        ),
+                        "default_accel_rad_sec2": ParameterValue(
+                            LaunchConfiguration("aubo_sdk_move_joint_accel_rad_sec2"),
+                            value_type=float,
+                        ),
+                        "default_goal_tolerance_rad": ParameterValue(
+                            LaunchConfiguration("aubo_sdk_move_joint_goal_tolerance_rad"),
+                            value_type=float,
+                        ),
+                        "default_timeout_sec": ParameterValue(
+                            LaunchConfiguration("aubo_sdk_move_joint_timeout_sec"),
+                            value_type=float,
+                        ),
+                        "arrival_timeout_padding_sec": ParameterValue(
+                            LaunchConfiguration("aubo_sdk_move_joint_arrival_padding_sec"),
+                            value_type=float,
+                        ),
+                        "dry_run": ParameterValue(
+                            LaunchConfiguration("aubo_move_joint_dry_run"),
+                            value_type=bool,
+                        ),
+                    }
+                ],
+                output="screen",
+            )
+        )
+
     return actions
 
 
@@ -307,6 +358,7 @@ def generate_launch_description():
             DeclareLaunchArgument("use_scout", default_value="true"),
             DeclareLaunchArgument("use_ms42dc", default_value="true"),
             DeclareLaunchArgument("use_aubo", default_value="true"),
+            DeclareLaunchArgument("use_aubo_ros2_driver", default_value="false"),
             DeclareLaunchArgument("scout_driver", default_value="waveshare"),
             DeclareLaunchArgument(
                 "scout_port",
@@ -316,13 +368,19 @@ def generate_launch_description():
             DeclareLaunchArgument("scout_can_bitrate", default_value="500000"),
             DeclareLaunchArgument("scout_frame_type", default_value="standard"),
             DeclareLaunchArgument("ms42dc_driver", default_value="direct"),
-            DeclareLaunchArgument("ms42dc_port", default_value="/dev/motor_serial"),
+            DeclareLaunchArgument(
+                "ms42dc_port",
+                default_value=EnvironmentVariable(
+                    "MS42DC_PORT",
+                    default_value="/dev/serial/by-id/usb-1a86_USB_Single_Serial_58EB003416-if00",
+                ),
+            ),
             DeclareLaunchArgument("ms42dc_baudrate", default_value="115200"),
             DeclareLaunchArgument("ms42dc_device_id", default_value="1"),
             DeclareLaunchArgument("ms42dc_sub_divide", default_value="32"),
             DeclareLaunchArgument("ms42dc_mode", default_value="2"),
-            DeclareLaunchArgument("ms42dc_open_angle_tenths", default_value="18720"),
-            DeclareLaunchArgument("ms42dc_close_angle_tenths", default_value="18720"),
+            DeclareLaunchArgument("ms42dc_open_angle_tenths", default_value="19656"),
+            DeclareLaunchArgument("ms42dc_close_angle_tenths", default_value="19656"),
             DeclareLaunchArgument("ms42dc_speed_tenths", default_value="150"),
             DeclareLaunchArgument("aubo_robot_ip", default_value="192.168.127.128"),
             DeclareLaunchArgument("aubo_type", default_value="aubo_i5"),
@@ -359,6 +417,17 @@ def generate_launch_description():
             DeclareLaunchArgument("aubo_sdk_speed_joint_time_sec", default_value="100.0"),
             DeclareLaunchArgument("aubo_sdk_stop_joint_accel_rad_sec2", default_value="8.0"),
             DeclareLaunchArgument("aubo_sdk_busy_retry_delay_sec", default_value="0.04"),
+            DeclareLaunchArgument("aubo_move_joint_action_name", default_value="/arachne/aubo/move_joint"),
+            DeclareLaunchArgument(
+                "aubo_move_joint_control_owner_name",
+                default_value="aubo_move_joint_action_server",
+            ),
+            DeclareLaunchArgument("aubo_sdk_move_joint_speed_rad_sec", default_value="0.25"),
+            DeclareLaunchArgument("aubo_sdk_move_joint_accel_rad_sec2", default_value="0.45"),
+            DeclareLaunchArgument("aubo_sdk_move_joint_goal_tolerance_rad", default_value="0.04"),
+            DeclareLaunchArgument("aubo_sdk_move_joint_timeout_sec", default_value="12.0"),
+            DeclareLaunchArgument("aubo_sdk_move_joint_arrival_padding_sec", default_value="3.0"),
+            DeclareLaunchArgument("aubo_move_joint_dry_run", default_value="false"),
             DeclareLaunchArgument("aubo_control_prefix", default_value=""),
             OpaqueFunction(function=_launch_setup),
         ]
