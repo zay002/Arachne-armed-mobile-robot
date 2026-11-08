@@ -12,6 +12,18 @@
 Arachne main is a ROS 2 Jazzy workspace for a Scout 2.0 mobile base, Aubo i5 arm,
 MS42DC gripper, Gemini335 RGB-D camera, and C16 lidar.
 
+## 版本选择 / Branches
+
+| 分支 | ROS / 系统 | 推荐用途 |
+| --- | --- | --- |
+| [main](https://github.com/zay002/Arachne-armed-mobile-robot/tree/main) | ROS 2 Jazzy / Ubuntu 24.04 | 本机与 WSL2 开发、模型展示、离线验证 |
+| [jetson](https://github.com/zay002/Arachne-armed-mobile-robot/tree/jetson) | ROS 2 Humble / Ubuntu 22.04 | Jetson 真机集成、示教与现场任务 |
+
+main 已合入本次更新前 jetson 的已提交功能；后续提交仍需同步并重新验证。
+**WSL2 用户推荐搭配 [hurry-porter](https://github.com/zay002/hurry-porter)**，
+快速扫描、诊断并穿透 Windows USB 串口、USB-CAN 和手柄到 WSL2。
+详细版本差异、验证边界和 USB 穿透步骤见 [版本与 WSL2 接入指南](docs/versions-and-wsl2.md)。
+
 `main` integrates the latest committed `jetson` features for Ubuntu 24.04 / WSL2;
 `jetson` remains the Ubuntu 22.04 / ROS 2 Humble hardware branch.
 
