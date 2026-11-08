@@ -24,6 +24,13 @@ main 已合入本次更新前 jetson 的已提交功能；后续提交仍需同�
 快速扫描、诊断并穿透 Windows USB 串口、USB-CAN 和手柄到 WSL2。
 详细版本差异、验证边界和 USB 穿透步骤见 [版本与 WSL2 接入指南](docs/versions-and-wsl2.md)。
 
+## Jazzy / WSL2 仿真展示
+
+![main 分支在 Jazzy / WSL2 中运行的 Gazebo 场景](https://raw.githubusercontent.com/zay002/Arachne-armed-mobile-robot/main/docs/demo/jazzy-gazebo.png)
+
+上图来自 **main 的 Jazzy / WSL2 实际运行**，不代表 Jetson Humble 的真机验证。
+运行方式与验证范围见 [main 的 Gazebo 说明](https://github.com/zay002/Arachne-armed-mobile-robot/tree/main#gazebo-仿真)。
+
 ## Build
 
 ```bash

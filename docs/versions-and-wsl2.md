@@ -52,10 +52,10 @@ Aubo 的局域网连接也不需要 USB 穿透，可使用 hurry-porter 的 LAN 
 
 ## 本次验证范围
 
-main：Jazzy 下 13 个包构建、离线入口检查及 dry-run 通过，RViz 模型与示教面板已实际运行。
+main：Jazzy 下包含 Gazebo 的 15 个包构建通过，离线入口检查及 dry-run 通过，RViz 模型、示教面板和 Gazebo 已实际运行。
 该 WSL2 环境中的 Fast DDS 模型消息接收异常，通过 Cyclone DDS 恢复显示；
 安装和启动方式见 [main README](https://github.com/zay002/Arachne-armed-mobile-robot/tree/main#jazzy--wsl2-model-preview)。
 
 README 中 Jazzy / WSL2 截图只代表 main 的本机展示，不作为 jetson 真机测试证据。
-本次未重新验证 Jetson 硬件、Humble 构建、Gazebo 或真实 USB attach。
+本次未重新验证 Jetson 硬件、Humble 构建或真实 USB attach。
 

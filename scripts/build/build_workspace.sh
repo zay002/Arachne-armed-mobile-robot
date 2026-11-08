@@ -56,11 +56,10 @@ has_cmake_package() {
   local status=0
 
   probe_dir="$(mktemp -d)"
-  cmake -E chdir "${probe_dir}" cmake --find-package \
-    -DNAME="${package}" \
-    -DCOMPILER_ID=GNU \
-    -DLANGUAGE=CXX \
-    -DMODE=EXIST >/dev/null 2>&1 || status=$?
+  # Gazebo's Protobuf dependency needs CXX enabled for FindThreads.
+  printf 'cmake_minimum_required(VERSION 3.16)\nproject(arachne_probe LANGUAGES CXX)\nfind_package(%s REQUIRED)\n' \
+    "${package}" > "${probe_dir}/CMakeLists.txt"
+  cmake -S "${probe_dir}" -B "${probe_dir}/build" >/dev/null 2>&1 || status=$?
   rm -rf "${probe_dir}"
   return "${status}"
 }
